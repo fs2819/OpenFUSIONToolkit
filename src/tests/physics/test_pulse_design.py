@@ -251,7 +251,7 @@ def _run_tokamaker_torax(
             t_init=0.0,
             t_final=t_final,
             eqtimes=[0.0, t_final],
-            g_eqdsk_arr=["seed_t0.eqdsk", "seed_t5.eqdsk"],
+            seeds=["seed_t0.eqdsk", "seed_t5.eqdsk"],
             tokamaker_obj=mygs,
             tx_dt=tx_dt,
             tm_times=tm_times,
@@ -273,7 +273,7 @@ def _run_tokamaker_torax(
         # H-mode pedestal-top targets; the TORAX L/H formation model owns the transition timing
         # (pedestal applied once P_SOL > P_LH), ramped over transition_time.
         tt.set_pedestal(
-            config_mode="ADAPTIVE_SOURCE",
+            config_mode="INTERNAL_BOUNDARY_CONDITION",
             ped_height_Te=3.0,
             ped_height_Ti=3.0,
             ped_height_ne=0.8e20,

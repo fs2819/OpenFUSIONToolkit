@@ -47,8 +47,17 @@ PSI_LCFS_WEIGHT = 1000.0
 N_PSI = 1000
 _NBI_W_TO_MA = 1/16e6
 mu_0 = 4.0 * np.pi * 1e-7
-# EQDSK sampling for save_eqdsk when validating with TORAX in _run_tm:
-EQDSK_SAVE_NR_NZ_SEQUENCE = (300, 900)
+#: Flux surfaces per equilibrium handed to TORAX (see fsa_psi_norm).
+#:
+#: TORAX interpolates these onto its own radial grid, so this only needs to stay ahead of
+#: that grid. Refined against an 800 surface build of the same ITER equilibrium, 100
+#: surfaces left ~1.2% on g1/g2 (the metric coefficients the transport equations use)
+#: whether TORAX ran at n_rho=51 or 125 -- i.e. the input count, not the grid, set the
+#: error. 200 halves it for ~19 ms per equilibrium, under a second per coupling loop.
+N_SURFACES = 200
+#: Grid resolution for the gEQDSK files fly(save_eqdsks=True) writes. Diagnostic output
+#: only -- the coupling itself never reads a gEQDSK back.
+EQDSK_SAVE_NR_NZ = 900
 
 # Default TORAX radial face count for loop 0 coarse runs (evenly spaced normalized rho).
 DEFAULT_LOOP0_TX_FACE_POINTS = 51
@@ -81,51 +90,58 @@ BASE_CONFIG = {
     'pedestal': {
         # 'model_name': 'set_T_ped_n_ped',
     },
-    # 'transport': { # recommended in TORAX documentation, TORAX hangs at t~0 when using this config.
-    #     'model_name': 'combined',
-    #     'transport_models': [
-    #         # Base model: QLKNN applied everywhere (default ADD)
-    #         {
-    #             'model_name': 'qlknn',
-    #             'rho_max': 1.0,
-    #         },
-    #         # Edge overwrite: Sets D_e and V_e in the edge, ignoring QLKNN there.
-    #         # Keeps chi_i/chi_e from QLKNN (because they are disabled here).
-    #         {
-    #             'model_name': 'constant',
-    #             'rho_min': 0.9,
-    #             'D_e': 0.5,
-    #             'V_e': -1.0,
-    #             'merge_mode': 'overwrite',
-    #             'disable_chi_i': True,
-    #             'disable_chi_e': True,
-    #         },
-    #     ],
-    # },
-    'transport': { # old base config
-        'model_name': 'qlknn',
-        'apply_inner_patch': True,
-        'rho_inner': 0.1,
-        'apply_outer_patch': False,
-        'D_e_outer': 0.1,
-        'V_e_outer': 0.0,
-        'chi_i_outer': 2.0,
-        'chi_e_outer': 2.0,
-        'rho_outer': 0.95,
+    # QLKNN everywhere, with a constant model overwriting it inside rho=0.1. This is the
+    # port of the old apply_inner_patch default, kept so configs behave as they used to.
+    #
+    # It is not required for stability. Dropping it did NaN the ITER example twice, but
+    # both of those runs predate the OpenMP fix in gs_get_qprof, and a clean run without
+    # the patch has since completed (conv_err 1.286%). Note the scan that reported those
+    # two runs as having uncorrupted geometry could only detect a stolen extremum index
+    # that landed out of range, which shows up as an exact zero; an in-range steal gives a
+    # plausible wrong value and is invisible to it. So the race is not excluded there.
+    #
+    # What the patch does buy is convergence -- loop 2 lands at 0.32-0.92% with it against
+    # 1.29% without -- for about 50 s of the ITER example's ~6 min, mostly on the
+    # TokaMaker side, since a different core transport gives a different core current
+    # profile for the GS solve to chase.
+    #
+    # The 'combined' wrapper is likewise required, not stylistic. TORAX removed
+    # apply_inner_patch / apply_outer_patch and the *_inner / *_outer coefficients; a
+    # patch is now a component model restricted with rho_min / rho_max and merged with
+    # 'overwrite'. Clipping and smoothing moved to the combined model too, where they act
+    # on the aggregated output of every component -- which is what the old
+    # smooth_everywhere=True asked for, so it has no separate setting any more.
+    #
+    # The patch values are the defaults the removed apply_inner_patch used.
+    # apply_outer_patch was False, so no outer component is built here.
+    'transport': {
+        'model_name': 'combined',
         'chi_min': 0.05,
         'chi_max': 100,
         'D_e_min': 0.05,
         'D_e_max': 50,
         'V_e_min': -10,
         'V_e_max': 10,
-        # 'smoothing_width': 0.3,
-        'DV_effective': True,
-        'include_ITG': True,
-        'include_TEM': True,
-        'include_ETG': True,
-        'avoid_big_negative_s': False,
-        'smooth_everywhere': True,
         'smoothing_width': 0.3,
+        'transport_models': [
+            {
+                'model_name': 'qlknn',
+                'DV_effective': True,
+                'include_ITG': True,
+                'include_TEM': True,
+                'include_ETG': True,
+                'avoid_big_negative_s': False,
+            },
+            {
+                'model_name': 'constant',
+                'rho_max': 0.1,
+                'merge_mode': 'overwrite',
+                'chi_i': 1.0,
+                'chi_e': 1.0,
+                'D_e': 0.2,
+                'V_e': 0.0,
+            },
+        ],
     },
     'solver': {
         'solver_type': 'newton_raphson',
@@ -226,23 +242,119 @@ class MyEncoder(json.JSONEncoder):
             return obj.to_numpy().tolist()
         return json.JSONEncoder.default(self, obj)
 
+def fsa_psi_norm(n_surfaces=N_SURFACES, last_surface_factor=0.99, psi_min=1.0e-4):
+    r'''! Flux surface sampling locations, uniform in \f$\sqrt{\hat{\psi}}\f$.
+
+        \f$\hat{\rho} \sim \sqrt{\hat{\psi}}\f$ near the axis, so sampling uniformly in
+        \f$\hat{\psi}\f$ leaves the core coarser than TORAX's grid-spacing warning allows.
+
+        @param n_surfaces Number of flux surfaces.
+        @param last_surface_factor Outermost surface, in \f$\hat{\psi}\f$; becomes
+               \f$\hat{\rho} = 1\f$ in TORAX.
+        @param psi_min Innermost surface (the axis itself cannot be traced).
+    '''
+    return np.linspace(np.sqrt(psi_min), np.sqrt(last_surface_factor), n_surfaces) ** 2
+
+
+def seed_from_equilibrium(equil, n_surfaces=N_SURFACES, last_surface_factor=0.99):
+    r'''! Seed record read straight off a solved TokaMaker equilibrium.
+
+        This is everything TokaMaker_TORAX takes from a seed: the shape and profile targets
+        it starts the TokaMaker side from, plus the geometry entry it hands TORAX. Profiles
+        come from the solver's own flux functions and the geometry is the flux surface
+        average set, so nothing is resampled onto a rectangular grid and re-contoured.
+
+        Sign convention is TokaMaker-native throughout (\f$\psi\f$ in Wb/rad with
+        \f$\psi_{axis} > \psi_{LCFS}\f$); @ref seed_from_eqdsk flips a gEQDSK to match.
+
+        @param equil Solved TokaMaker or TokaMaker_equilibrium object.
+        @param n_surfaces Flux surfaces for get_fsa().
+        @param last_surface_factor Outermost flux surface, in \f$\hat{\psi}\f$.
+        @return Seed record dict, as consumed by TokaMaker_TORAX.__init__.
+    '''
+    fsa = equil.get_fsa(psi=fsa_psi_norm(n_surfaces, last_surface_factor))
+    psi_norm = np.linspace(0.0, 1.0, N_PSI)
+    _, F, Fp, P, Pp = equil.get_profiles(psi=psi_norm)
+    # The LCFS itself is singular when diverted; take the outermost traced surface.
+    lcfs = np.array(equil.trace_surf(float(fsa['psi_norm'][-1])), dtype=float)
+    R_centr = 0.5 * (lcfs[:, 0].max() + lcfs[:, 0].min())
+    return {
+        'R_centr': R_centr,
+        'Z_axis': fsa['Z_axis'],
+        'B_centr': fsa['F0'] / R_centr,
+        'pax': float(P[0]),
+        'Ip': abs(equil.get_globals()[0]),
+        'psi_axis': fsa['psi_axis'],
+        'psi_lcfs': fsa['psi_boundary'],
+        'lcfs': lcfs,
+        'psi_norm': psi_norm,
+        'ffprim': F * Fp,
+        'pprime': Pp,
+        'qpsi': np.interp(psi_norm, fsa['psi_norm'], fsa['q']),
+        'pres': P,
+        'geometry': {'equilibrium': fsa},
+    }
+
+
+def seed_from_eqdsk(path, cocos=2):
+    r'''! Seed record from a gEQDSK file, for seeds solved outside this module.
+
+        Same content as @ref seed_from_equilibrium, but TORAX has to re-contour the file to
+        get its geometry. TokaMaker writes gEQDSKs with cocos=2, which negates its native
+        \f$\psi\f$, so \f$\psi\f$ and every \f$d/d\psi\f$ is flipped back here -- downstream
+        code then never has to care which kind of seed it was given.
+
+        @param path Path to the gEQDSK file.
+        @param cocos COCOS convention of the file.
+        @return Seed record dict, as consumed by TokaMaker_TORAX.__init__.
+    '''
+    g = read_eqdsk(path)
+    # The file's flux grid is nominally [0, 1] but really spans [0, 1 - lcfs_pad], so a
+    # padded gEQDSK shifts every profile abscissa by that pad (~1% for save_eqdsk's default,
+    # worth a fraction of a percent on the profiles at mid-radius). The pad is not recorded
+    # in the file; @ref seed_from_equilibrium has no such offset.
+    return {
+        'R_centr': g['rcentr'],
+        'Z_axis': g['zaxis'],  # magnetic axis Z, not grid midpoint (zmid)
+        'B_centr': g['bcentr'],
+        'pax': float(g['pres'][0]),
+        'Ip': abs(g['ip']),
+        'psi_axis': -g['psimag'],
+        'psi_lcfs': -g['psibry'],
+        'lcfs': np.asarray(g['rzout'], dtype=float),
+        'psi_norm': np.linspace(0.0, 1.0, g['nr']),
+        'ffprim': -np.asarray(g['ffprim'], dtype=float),
+        'pprime': -np.asarray(g['pprime'], dtype=float),
+        'qpsi': np.asarray(g['qpsi'], dtype=float),
+        'pres': np.asarray(g['pres'], dtype=float),
+        'geometry': {'geometry_file': os.path.abspath(path), 'cocos': cocos},
+    }
+
+
 class TokaMaker_TORAX:
     '''! TokaMaker + TORAX Coupled Pulse Simulation Code'''
 
 
     # ─── Initialization ─────────────────────────────────────────────────────────
 
-    def __init__(self, t_init, t_final, eqtimes, g_eqdsk_arr, tokamaker_obj, tx_dt=0.1, tm_times=None, last_surface_factor=0.99, truncate_eq=False):
+    def __init__(self, t_init, t_final, eqtimes, seeds, tokamaker_obj, tx_dt=0.1, tm_times=None, last_surface_factor=0.99, truncate_eq=False,
+                 n_surfaces=N_SURFACES):
         r'''! Initialize the Coupled TokaMaker + TORAX object.
                 @param t_init Start time (s).
                 @param t_final End time (s).
-                @param eqtimes Time points of each gEQDSK file.
-                @param g_eqdsk_arr Filenames of each gEQDSK file.
+                @param eqtimes Time points of each seed equilibrium.
+                @param seeds Seed equilibria, one per entry of eqtimes. Either gEQDSK filenames
+                       or seed records from @ref seed_from_equilibrium (which is what
+                       @ref _create_seed_equilibria returns, so a run that solves its own seeds
+                       never touches a gEQDSK). Mixing the two is not allowed: TORAX applies one
+                       geometry type to every time slice of a config.
                 @param tokamaker_obj Preconfigured TokaMaker object.
                 @param tx_dt Time step (s) of TORAX simulation.
                 @param tm_times Time points where TokaMaker solves equilibrium.
-                @param last_surface_factor Last surface factor for Torax.
+                @param last_surface_factor Outermost flux surface handed to TORAX, in
+                       \f$\hat{\psi}\f$. This surface becomes \f$\hat{\rho} = 1\f$.
                 @param truncate_eq Whether to truncate equilibrium when saving TokaMaker output to EQDSK.
+                @param n_surfaces Flux surfaces per equilibrium handed to TORAX.
                 @brief Coupling fly() option loop0: if True, the first coupling pass uses a coarse
                        TORAX grid and subsampled TokaMaker times; if False, that pass is skipped (see fly()).
 
@@ -253,15 +365,20 @@ class TokaMaker_TORAX:
         self._state = {}
         self._eqtimes = eqtimes
         self._results = {}
-        self._init_files = g_eqdsk_arr
         self._t_init = t_init
         self._t_final = t_final
         self._tx_dt = tx_dt # TORAX timestep
         self._last_surface_factor = last_surface_factor
+        self._n_surfaces = int(n_surfaces)
         self._psi_N = np.linspace(0.0, 1.0, N_PSI) # standardized psi_N grid all values should be mapped onto
         self._truncate_eq = truncate_eq
 
+        self._seeds = [seed_from_eqdsk(s, self._cocos) if isinstance(s, (str, os.PathLike))
+                       else s for s in seeds]
+
         self._current_loop = 0
+
+        self._loop_timings = []
 
         self._coupling_cost_history = []
 
@@ -462,52 +579,37 @@ class TokaMaker_TORAX:
             y_new_cs = cs_y(u_new)
             return np.column_stack([x_new_cs, y_new_cs])
 
-        for i, t in enumerate(self._eqtimes):
-            g = read_eqdsk(g_eqdsk_arr[i])
-            zmax = np.max(g['rzout'][:,1])
-            zmin = np.min(g['rzout'][:,1])
-            rmax = np.max(g['rzout'][:,0])
-            rmin = np.min(g['rzout'][:,0])
+        # Seed records are already TM-native (see seed_from_eqdsk for the gEQDSK sign flip),
+        # so nothing here needs to know where a seed came from.
+        for g in self._seeds:
+            rz = g['lcfs']
+            zmax, zmin = np.max(rz[:,1]), np.min(rz[:,1])
+            rmax, rmin = np.max(rz[:,0]), np.min(rz[:,0])
             minor_radius = (rmax - rmin) / 2.0
             rgeo = (rmax + rmin) / 2.0
-            highest_pt_idx = np.argmax(g['rzout'][:,1])
-            lowest_pt_idx = np.argmin(g['rzout'][:,1])
-            rupper = g['rzout'][highest_pt_idx][0]
-            rlower = g['rzout'][lowest_pt_idx][0]
+            rupper = rz[np.argmax(rz[:,1])][0]
+            rlower = rz[np.argmin(rz[:,1])][0]
             delta_upper = (rgeo - rupper) / minor_radius
             delta_lower = (rgeo - rlower) / minor_radius
 
-            R.append(g['rcentr'])
-            Z.append(g['zaxis'])  # magnetic axis Z, not grid midpoint (zmid)
+            R.append(g['R_centr'])
+            Z.append(g['Z_axis'])
             a.append(minor_radius)
             kappa.append((zmax - zmin) / (2.0 * minor_radius))
             delta.append((delta_upper + delta_lower) / 2.0)
 
-            B0.append(g['bcentr'])
-            pax.append(g['pres'][0])
-            Ip.append(abs(g['ip']))
+            B0.append(g['B_centr'])
+            pax.append(g['pax'])
+            Ip.append(g['Ip'])
+            psi_axis.append(g['psi_axis'])
+            psi_lcfs.append(g['psi_lcfs'])
 
-            # Eqdsks are written via TokaMaker save_eqdsk(cocos=2), which negates
-            # TM's native psi on write. Flip sign back to store TM-native in _state
-            # (psi_axis > psi_lcfs, in Wb/rad). Sign is preserved (can be ±).
-            psi_axis.append(-g['psimag'])
-            psi_lcfs.append(-g['psibry'])
+            lcfs.append(interp_tm_lcfs(rz))
 
-            lcfs.append(interp_tm_lcfs(g['rzout']))
-
-            psi_eqdsk = np.linspace(0.0, 1.0, g['nr'])
-            # cocos=2 file psi = -psi_TM, so d/dpsi_file = -d/dpsi_TM.
-            # Flip pprime and ffprime to get TM-native derivatives.
-            ffp = -np.interp(self._psi_N, psi_eqdsk, g['ffprim'])
-            pp  = -np.interp(self._psi_N, psi_eqdsk, g['pprime'])
-            q = np.interp(self._psi_N, psi_eqdsk, g['qpsi'])
-
-            ffp_prof.append(ffp)
-            pp_prof.append(pp)
-            q_prof.append(q)
-
-            pres = np.interp(self._psi_N, psi_eqdsk, g['pres'])
-            pres_prof.append(pres)
+            ffp_prof.append(np.interp(self._psi_N, g['psi_norm'], g['ffprim']))
+            pp_prof.append(np.interp(self._psi_N, g['psi_norm'], g['pprime']))
+            q_prof.append(np.interp(self._psi_N, g['psi_norm'], g['qpsi']))
+            pres_prof.append(np.interp(self._psi_N, g['psi_norm'], g['pres']))
 
         self.lcfs = lcfs
 
@@ -603,9 +705,9 @@ class TokaMaker_TORAX:
         self._pedestal_config = None
 
         # ── Pedestal config mode (set_pedestal) ──────────────────────────────
-        # 'ADAPTIVE_SOURCE' | 'ADAPTIVE_TRANSPORT' | 'internal_manual'.
+        # 'INTERNAL_BOUNDARY_CONDITION' | 'ADAPTIVE_TRANSPORT' | 'internal_manual'.
         self._ped_mode = 'off'
-        # Enable the L/H formation model under ADAPTIVE_SOURCE (new-API pedestals only).
+        # Enable the L/H formation model under INTERNAL_BOUNDARY_CONDITION (new-API pedestals only).
         self._ped_formation_model = False
         # internal_manual pedestal knobs (heights in keV / m^-3; widths/times in rho_norm / s).
         self._ped_height_Te = None
@@ -613,7 +715,7 @@ class TokaMaker_TORAX:
         self._ped_height_ne = None
         self._ped_width = 0.15
         self._ped_transition_time = 0.5
-        self._ped_timing = 'detect'      # 'detect' (loop-1 ADAPTIVE_SOURCE) or 'input'
+        self._ped_timing = 'detect'      # 'detect' (loop-1 formation model) or 'input'
         self._lh_time = None             # L->H transition time (s); set by user or detection
         self._hl_time = None             # H->L back-transition time (s); None if none
         self._ped_formation_model_name = 'delabie_scaling'  # L/H formation model for detect loop
@@ -701,18 +803,19 @@ class TokaMaker_TORAX:
         self._isoflux_weight = LCFS_WEIGHT
         self._psi_lcfs_weight = PSI_LCFS_WEIGHT
 
-        self._eqdsk_skip = []
+        # {(loop, i): get_fsa() dict} for every TokaMaker solve TORAX accepted. This is the
+        # geometry the coupling passes between the codes: presence of a key means "TORAX has
+        # geometry for that timestep", which a failed solve simply never sets. _tm_stats holds
+        # the matching diagnostic scalars, recorded while the equilibrium is still in hand.
+        self._equil_fsa = {}
+        self._tm_stats = {}
 
         # Psi snapshots for movie generation (populated during _run_tm)
         self._tm_psi_on_nodes = {}  # {loop: {i: psi_array}}
 
         # Temp/output directory state (set in fly())
         self._out_dir = None
-        self._eqdsk_dir = None
-        self._eqdsk_dir_is_temp = False
-        # {(loop, i): diverted?} for each gEQDSK written; a gEQDSK carries no topology flag,
-        # so this is what lets a later loop report the topology of the file it reads back.
-        self._eqdsk_topology = {}
+        self._save_eqdsks = False
         self._save_outputs = False
         self._debug_mode = False
         self._output_mode = False
@@ -901,7 +1004,7 @@ class TokaMaker_TORAX:
                 The loaded config is deep-merged on top of BASE_CONFIG when the
                 simulation config is built.  Any key present in the loaded config
                 will override the corresponding BASE_CONFIG key; keys only in
-                BASE_CONFIG are kept as-is.  Geometry is always overwritten (eqdsk-based).
+                BASE_CONFIG are kept as-is.  Geometry is always overwritten.
 
                 Explicit set_*() calls made AFTER load_TORAX_config() will
                 override both the base and the loaded config.
@@ -953,7 +1056,7 @@ class TokaMaker_TORAX:
         self._tx_grid_type, self._tx_grid = self._tx_grid_stash.pop()
 
     def _coupling_iteration_is_first(self):
-        r'''! True on the first TokaMaker_TORAX loop (TORAX uses the seed gEQDSK map).'''
+        r'''! True on the first TokaMaker_TORAX loop (TORAX uses the seed geometry map).'''
         if self._current_loop == 0:
             return True
         if not getattr(self, '_fly_loop0', True) and self._current_loop == 1:
@@ -1500,15 +1603,16 @@ class TokaMaker_TORAX:
 
                 Three modes via config_mode:
                 - 'off'                   : no pedestal (default).
-                - 'ADAPTIVE_SOURCE'    : TORAX set_T_ped_n_ped pedestal in ADAPTIVE_SOURCE mode.
+                - 'INTERNAL_BOUNDARY_CONDITION' : TORAX set_T_ped_n_ped pedestal in
+                                            INTERNAL_BOUNDARY_CONDITION mode.
                                             ped_height_* are the H-mode pedestal-top targets and
-                                            use_formation_model_with_adaptive_source is enabled, so
+                                            use_formation_model_with_internal_boundary_condition is set, so
                                             TORAX's L/H state machine owns the timing: the pedestal
                                             appears when P_SOL > P_LH and is removed when
                                             P_SOL < 0.8*P_LH, ramped over transition_time. Passing the
                                             legacy set_pedestal toggle instead prescribes the on/off
                                             schedule by hand and disables the formation model.
-                - 'ADAPTIVE_TRANSPORT' : same pedestal model in ADAPTIVE_TRANSPORT mode.
+                - 'ADAPTIVE_TRANSPORT'  : same pedestal model in ADAPTIVE_TRANSPORT mode.
                 - 'internal_manual'       : pedestal imposed by us as a TORAX internal boundary
                                             condition (IBC), not a TORAX pedestal model. The pedestal
                                             top sits at rho = 1 - ped_width and an mtanh shape is imposed
@@ -1519,7 +1623,8 @@ class TokaMaker_TORAX:
                                             ramping the TORAX-evolved L-mode core into a smooth
                                             H-mode-like core shape, then retreating to the pedestal band.
 
-                @param config_mode 'off', 'ADAPTIVE_SOURCE', 'ADAPTIVE_TRANSPORT', or 'internal_manual'.
+                @param config_mode 'off', 'INTERNAL_BOUNDARY_CONDITION', 'ADAPTIVE_TRANSPORT', or
+                                   'internal_manual'.
                 @param config Optional full pedestal-section dict (tx_adaptive modes only); overrides defaults.
                 @param ped_height_Te Electron-temperature pedestal-top value (keV); all modes.
                 @param ped_height_Ti Ion-temperature pedestal-top value (keV); all modes (defaults to Te).
@@ -1528,11 +1633,11 @@ class TokaMaker_TORAX:
                                  (internal_manual; the tx_adaptive modes use ped_top instead).
                 @param transition_time Ramp duration (s) over which the pedestal rises from L-mode
                                        (TORAX transition_time_width in the tx_adaptive modes).
-                @param timing 'detect' (find L/H times from a loop-1 ADAPTIVE_SOURCE run) or 'input'.
+                @param timing 'detect' (find L/H times from a loop-1 formation-model run) or 'input'.
                 @param lh_time L->H transition time (s); required when timing='input'.
                 @param hl_time H->L back-transition time (s); None means the pedestal stays on.
                 @param formation_model L/H formation-model name driving the transitions in
-                                       ADAPTIVE_SOURCE mode and the internal_manual 'detect' loop
+                                       INTERNAL_BOUNDARY_CONDITION mode and the internal_manual 'detect' loop
                                        (e.g. 'delabie_scaling', 'martin_scaling').
                 @param adaptive_T_source_prefactor Stiffness of the internal_manual T_e/T_i IBC (TORAX
                                        numerics.adaptive_T_source_prefactor). The IBC is a soft
@@ -1556,13 +1661,19 @@ class TokaMaker_TORAX:
                 @param n_e_ped Legacy electron-density pedestal (tx_adaptive).
                 @param ped_top Legacy pedestal-top location rho_norm_ped_top (tx_adaptive).
         '''
-        if config_mode not in ('off', 'ADAPTIVE_SOURCE', 'ADAPTIVE_TRANSPORT', 'internal_manual'):
-            raise ValueError("config_mode must be 'off', 'ADAPTIVE_SOURCE', 'ADAPTIVE_TRANSPORT', or 'internal_manual'.")
+        # TORAX renamed this mode; keep old configs running rather than failing validation.
+        if config_mode == 'ADAPTIVE_SOURCE':
+            print("NOTICE: config_mode='ADAPTIVE_SOURCE' has been renamed to "
+                  "'INTERNAL_BOUNDARY_CONDITION' (following TORAX); using the new mode.")
+            config_mode = 'INTERNAL_BOUNDARY_CONDITION'
+        if config_mode not in ('off', 'INTERNAL_BOUNDARY_CONDITION', 'ADAPTIVE_TRANSPORT', 'internal_manual'):
+            raise ValueError("config_mode must be 'off', 'INTERNAL_BOUNDARY_CONDITION', "
+                             "'ADAPTIVE_TRANSPORT', or 'internal_manual'.")
         # Legacy signature (pedestal requested through the tx_adaptive args, before config_mode
-        # existed): honor it as ADAPTIVE_SOURCE rather than silently building no pedestal.
+        # existed): honor it as a pedestal rather than silently building none.
         if config_mode == 'off' and any(arg is not None for arg in
                                         (config, set_pedestal, T_i_ped, T_e_ped, n_e_ped)):
-            config_mode = 'ADAPTIVE_SOURCE'
+            config_mode = 'INTERNAL_BOUNDARY_CONDITION'
         self._ped_mode = config_mode
 
         if config_mode == 'off':
@@ -1602,7 +1713,7 @@ class TokaMaker_TORAX:
             self._ped_core_relaxed = {}
             return
 
-        # ── ADAPTIVE_SOURCE / ADAPTIVE_TRANSPORT ──
+        # ── INTERNAL_BOUNDARY_CONDITION / ADAPTIVE_TRANSPORT ──
         # A full pedestal dict overrides everything else (former load_pedestal_config).
         self._pedestal_config = copy.deepcopy(config) if config is not None else None
         # TORAX gates the whole pedestal model on its `set_pedestal` flag, so it must be True
@@ -2174,14 +2285,14 @@ class TokaMaker_TORAX:
                 if self._ped_n_source_prefactor is not None:
                     myconfig['numerics']['adaptive_n_source_prefactor'] = self._ped_n_source_prefactor
             else:
-                # Detection loop: ADAPTIVE_SOURCE + formation model gives the L/H state
+                # Detection loop: INTERNAL_BOUNDARY_CONDITION + formation model gives the L/H state
                 # machine; set_pedestal=False so the (later) IBC solely owns the edge.
                 myconfig['pedestal'] = {
                     'model_name': 'set_T_ped_n_ped',
                     'set_pedestal': False,
-                    'mode': 'ADAPTIVE_SOURCE',
+                    'mode': 'INTERNAL_BOUNDARY_CONDITION',
                     'pedestal_profile_form': 'MTANH',
-                    'use_formation_model_with_adaptive_source': True,
+                    'use_formation_model_with_internal_boundary_condition': True,
                     'transition_time_width': self._ped_transition_time,
                     'formation_model': {'model_name': self._ped_formation_model_name},
                 }
@@ -2201,11 +2312,11 @@ class TokaMaker_TORAX:
                 ped_cfg['model_name'] = 'set_T_ped_n_ped'
                 ped_cfg['set_pedestal'] = self._set_pedestal
                 ped_cfg['mode'] = self._ped_mode
-                if self._ped_mode == 'ADAPTIVE_SOURCE' and self._ped_formation_model:
+                if self._ped_mode == 'INTERNAL_BOUNDARY_CONDITION' and self._ped_formation_model:
                     # L/H state machine: the pedestal values below are the H-mode targets, and
                     # TORAX applies them only once P_SOL > P_LH (and removes them below
                     # P_LH_hysteresis_factor * P_LH), ramped over transition_time_width.
-                    ped_cfg['use_formation_model_with_adaptive_source'] = True
+                    ped_cfg['use_formation_model_with_internal_boundary_condition'] = True
                     ped_cfg['transition_time_width'] = self._ped_transition_time
                     ped_cfg['formation_model'] = {'model_name': self._ped_formation_model_name}
                 if self._ped_top is not None:
@@ -2289,9 +2400,9 @@ class TokaMaker_TORAX:
                    Every key in the loaded config overwrites the matching base key;
                    keys only in BASE_CONFIG are kept as-is.
                 3. Override geometry (always set to use TokaMaker equilibria).
-                   For loop 1+ with injected psi and relax=False, the seed EQDSK is
+                   For loop 1+ with injected psi and relax=False, the seed is
                    forced at t_initial (psi from initial TORAX relax on seed); if relax=True,
-                   loop N relax keeps psi on the TM i=0 surface so TM EQDSK is used.
+                   loop N relax keeps psi on the TM i=0 surface so the TM equilibrium is used.
                 4. Override t_initial / t_final / fixed_dt from __init__ params.
                 5. Use psi profile from initial TORAX relax (if available) from profile_conditions.
                 6. Apply any explicit set_*() overrides (only when the attribute is
@@ -2314,117 +2425,82 @@ class TokaMaker_TORAX:
             self._tx_config_merge(myconfig, self._loaded_config)
 
         # ── 3. Geometry (always set by TokaMaker_TORAX) ─────────────────────────────
-        myconfig['geometry'] = {
-            'geometry_type': 'eqdsk',
-            'geometry_directory': os.getcwd(),
-            'last_surface_factor': self._last_surface_factor,
-            'n_surfaces': 50,
-            'Ip_from_parameters': True, # True tells TX to pull from config, not from eqdsk, in case eqdsks fail TX retains correct Ip targets
-        }
+        prev_lp = self._current_loop - 1
         if self._coupling_iteration_is_first():
-            eq_safe = []
-            t_safe = []
+            entries = {}
             t_skipped = []
             for i, t in enumerate(self._eqtimes):
-                eq = self._init_files[i]
-                if self._test_eqdsk_tx_config(eq):
-                    eq_safe.append(eq)
-                    t_safe.append(t)
-                else:
-                    if not self._skip_bad_init_eqdsks:
-                        raise ValueError(f'Bad initial gEQDSK at t={t}: {eq}')
+                if self._test_tx_geometry(self._seeds[i]['geometry']):
+                    entries[t] = self._seeds[i]['geometry']
+                elif self._skip_bad_init_eqdsks:
                     t_skipped.append(t)
-            self._log(f'\tTX: {len(eq_safe)}/{len(self._eqtimes)} initial EQDSKs valid'
+                else:
+                    raise ValueError(f'Bad seed equilibrium at t={t}: {self._seeds[i]["geometry"]}'
+                                     + self._tx_geometry_error_detail())
+            self._log(f'\tTX: {len(entries)}/{len(self._eqtimes)} seed equilibria valid'
                       + (f', skipped {len(t_skipped)}' if t_skipped else ''))
-            myconfig['geometry']['geometry_configs'] = {
-                t: {'geometry_file': eq_safe[i], 'cocos': self._cocos} for i, t in enumerate(t_safe)
-            }
         else:
-            # For times where TM succeeded last loop, use the TM-solved EQDSK.
-            # For times where TM failed, omit from the map (TORAX interpolates from neighbors),
-            # except t=0 which always gets a seed fallback (see below).
-            full_eqdsk_map = {}
+            entries = {}
             n_tm = 0
             if self._steady_state_mode:
                 i_last = len(self._tm_times) - 1
-                eq_last = os.path.join(self._eqdsk_dir, f'{self._current_loop - 1:03d}.{i_last:03d}.eqdsk')
-                tm_last_ok = eq_last not in self._eqdsk_skip and os.path.isfile(eq_last)
-                if tm_last_ok:
-                    for t in self._tm_times:
-                        full_eqdsk_map[t] = eq_last
+                fsa_last = self._equil_fsa.get((prev_lp, i_last))
+                if fsa_last is not None:
+                    entries = {t: {'equilibrium': fsa_last} for t in self._tm_times}
                     n_tm = len(self._tm_times)
                     self._log(
                         f'Loop {self._current_loop}: steady_state_mode geometry — all TX times use '
-                        f'final TM EQDSK from loop {self._current_loop - 1}: {os.path.basename(eq_last)}.'
+                        f'the final TM equilibrium from loop {prev_lp} (t index {i_last}).'
                     )
                 else:
                     self._log(
-                        f'Loop {self._current_loop}: steady_state_mode: final TM EQDSK missing or skipped '
-                        f'({os.path.basename(eq_last)}); falling back to per-time TM map.'
+                        f'Loop {self._current_loop}: steady_state_mode: final TM equilibrium (t index '
+                        f'{i_last}) unavailable; falling back to per-time TM map.'
                     )
 
             if not self._steady_state_mode or n_tm == 0:
-                # Build a geometry entry for EVERY tm_time so a failed TM solve can
-                # never leave a gap (a gap makes TORAX silently interpolate geometry
-                # across the failure, which can corrupt a/R/B_0 over the whole time
-                # series — e.g. a failed t=0 once flattened the entire ramp). Fallback
-                # priority per failed time: (1) the most-recent EARLIER tm_time that
-                # solved this loop (carry-forward last-good equilibrium), else
-                # (2) the nearest seed EQDSK (by eqtime), else (3) the next later
-                # solved tm_time. Each fallback is TORAX-validated before use.
-                full_eqdsk_map = {}
-                n_tm = 0
-                solved = {}  # i -> eqdsk path for TM solves that succeeded
+                # A time whose TM solve failed has no entry in _equil_fsa; leave it out of the
+                # map so TORAX interpolates geometry across it from its neighbours.
+                entries = {}
                 for i, t in enumerate(self._tm_times):
-                    eqdsk = os.path.join(self._eqdsk_dir, f'{self._current_loop - 1:03d}.{i:03d}.eqdsk')
-                    # TM stage already saved and validated each EQDSK with TORAX (_run_tm).
-                    if eqdsk not in self._eqdsk_skip and os.path.isfile(eqdsk):
-                        solved[i] = eqdsk
-
-                n_failed = 0
-                for i, t in enumerate(self._tm_times):
-                    if i in solved:
-                        full_eqdsk_map[t] = solved[i]
-                        n_tm += 1
+                    fsa = self._equil_fsa.get((prev_lp, i))
+                    if fsa is not None:
+                        entries[t] = {'equilibrium': fsa}
                     else:
-                        # Failed solve — leave this time out of the map so TORAX
-                        # interpolates geometry across it from its neighbours.
-                        n_failed += 1
                         self._log(f'Loop {self._current_loop}: TM failed at t={t:.2f}s; '
                                   f'skipping timepoint in TORAX geometry (TORAX will interpolate).')
-                if n_failed:
-                    self._log(f'Loop {self._current_loop}: {n_failed} failed TM '
+                n_tm = len(entries)
+                if n_tm < len(self._tm_times):
+                    self._log(f'Loop {self._current_loop}: {len(self._tm_times) - n_tm} failed TM '
                               f'timestep(s) skipped in TORAX geometry map.')
 
-            # Injected psi from initial relax used the seed EQDSK.  If we used
-            # the TM EQDSK at t_init without a loop N re-relax, the metric changes
+            # Injected psi from initial relax used the seed geometry.  If we used
+            # the TM equilibrium at t_init without a loop N re-relax, the metric changes
             # and j becomes inconsistent.  When relax=False, force seed at t_init.
             # When relax=True, loop N relax aligns psi with TM i=0 — keep TM.
-            # steady_state_mode uses the final TM EQDSK everywhere and seeds psi from the
-            # previous TORAX t_final; do not replace t_init with the seed file.
+            # steady_state_mode uses the final TM equilibrium everywhere and seeds psi from the
+            # previous TORAX t_final; do not replace t_init with the seed.
             if (self._psi_init is not None and not self._relax
                     and not self._steady_state_mode):
-                seed_eqdsk_tinit = self._init_files[0]
-                if self._test_eqdsk_tx_config(seed_eqdsk_tinit):
-                    full_eqdsk_map[self._t_init] = seed_eqdsk_tinit
+                seed_geo = self._seeds[0]['geometry']
+                if 'equilibrium' not in seed_geo:
                     self._log(
-                        f'Loop {self._current_loop}: seed EQDSK at t_init={self._t_init} s for TORAX '
+                        f'Loop {self._current_loop}: seed at t_init not applied — a gEQDSK seed '
+                        'cannot share a config with the TM flux surface averages.'
+                    )
+                elif self._test_tx_geometry(seed_geo):
+                    entries[self._t_init] = seed_geo
+                    self._log(
+                        f'Loop {self._current_loop}: seed equilibrium at t_init={self._t_init} s for TORAX '
                         f'(psi from initial relax on seed; inter-loop relax disabled).'
                     )
 
             if n_tm == 0:
-                self._log(f'Warning: Loop {self._current_loop}: no valid TM EQDSKs from loop {self._current_loop-1}, using all seed EQDSKs.')
+                self._log(f'Warning: Loop {self._current_loop}: no valid TM equilibria from loop {prev_lp}.')
             else:
-                self._log(f'Loop {self._current_loop}: using {n_tm}/{len(self._tm_times)} TM-solved EQDSKs, {len(self._tm_times)-n_tm} seed fallbacks.')
+                self._log(f'Loop {self._current_loop}: using {n_tm}/{len(self._tm_times)} TM-solved equilibria.')
 
-            myconfig['geometry']['geometry_configs'] = {
-                t: {'geometry_file': eqdsk_f, 'cocos': self._cocos} for t, eqdsk_f in full_eqdsk_map.items()
-            }
-
-        if self._tx_grid_type == 'n_rho':
-            myconfig['geometry']['n_rho'] = self._tx_grid
-        elif self._tx_grid_type == 'face_centers':
-            myconfig['geometry']['face_centers'] = self._tx_grid
+        myconfig['geometry'] = self._tx_geometry(entries)
 
         # ── 4. Override t_initial / t_final / fixed_dt from __init__ ───────
         myconfig.setdefault('numerics', {})
@@ -2479,9 +2555,9 @@ class TokaMaker_TORAX:
         # by save_tmtx_config(). 
         if self._current_loop == 1 and getattr(self, '_tx_config_snapshot', None) is None:
             snap = copy.deepcopy(myconfig)
-            # Geometry is rebuilt from seed eqdsks on replay; keep only the radial grid
+            # Geometry is rebuilt from the seeds on replay; keep only the radial grid
             # (n_rho / face_centers, picked up by load_TORAX_config) and drop the
-            # loop-specific eqdsk map and other eqdsk-derived geometry keys.
+            # loop-specific geometry map and the other geometry keys.
             geom = snap.get('geometry', {})
             grid_only = {k: geom[k] for k in ('n_rho', 'face_centers') if k in geom}
             if grid_only:
@@ -2507,33 +2583,110 @@ class TokaMaker_TORAX:
         tx_config = torax.ToraxConfig.from_dict(myconfig)
         return tx_config
 
-    def _test_eqdsk_tx_config(self, eqdsk, *, quiet=False):
-        r'''! Return whether TORAX accepts eqdsk as ToraxConfig geometry.
+    def _tx_geometry(self, entries, *, Ip_from_parameters=True):
+        r'''! Build the TORAX geometry block for a {time: geometry entry} map.
 
-                @param quiet If True, do not print or append to the coupling log on failure
-                       (used for intermediate-resolution retries in _run_tm). If False,
-                       failure is only reported when output_mode is 'debug'.
+                An entry is either {'equilibrium': get_fsa() dict} -- what every TokaMaker solve
+                produces, and what a seed solved by @ref _create_seed_equilibria produces -- or
+                {'geometry_file': ..., 'cocos': ...} for a gEQDSK seed supplied from outside.
+                TORAX applies one geometry type to all of its time slices, so a config is either
+                all flux surface averages or all gEQDSK; callers that could mix the two drop the
+                gEQDSK entry instead.
 
+                @param entries {time: geometry entry}.
+                @param Ip_from_parameters True tells TORAX to take Ip from the config rather than
+                       from the geometry, so a bad equilibrium cannot move the Ip target.
+                @return Geometry sub-dict for a TORAX config.
+        '''
+        is_fsa = [('equilibrium' in e) for e in entries.values()]
+        if all(is_fsa):
+            geometry = {'geometry_type': 'tokamaker'}
+        elif not any(is_fsa):
+            geometry = {
+                'geometry_type': 'eqdsk',
+                'geometry_directory': os.getcwd(),
+                'last_surface_factor': self._last_surface_factor,
+                'n_surfaces': 50,
+            }
+        else:
+            raise ValueError('TORAX geometry entries mix flux surface averages and gEQDSK files; '
+                             'a TORAX config takes one geometry type for all time slices.')
+        geometry['Ip_from_parameters'] = Ip_from_parameters
+        geometry['geometry_configs'] = dict(entries)
+        if self._tx_grid_type == 'n_rho':
+            geometry['n_rho'] = self._tx_grid
+        elif self._tx_grid_type == 'face_centers':
+            geometry['face_centers'] = self._tx_grid
+        return geometry
+
+    def _write_eqdsks(self):
+        r'''! Write one gEQDSK per TokaMaker timestep of the final loop (fly(save_eqdsks=True)).
+
+                Purely diagnostic; nothing reads these back. _state['equil'][i] holds the most
+                recent solve at each timestep, which is the final loop's.
+        '''
+        lp = max((k[0] for k in self._equil_fsa), default=self._current_loop)
+        n_written = 0
+        for i in range(len(self._tm_times)):
+            equil = self._state['equil'].get(i)
+            if equil is None:
+                continue
+            path = os.path.join(self._out_dir, f'{lp:03d}.{i:03d}.eqdsk')
+            try:
+                with self._quiet_tm():
+                    equil.save_eqdsk(path, lcfs_pad=1 - self._last_surface_factor,
+                                     run_info='TokaMaker EQDSK', cocos=self._cocos,
+                                     nr=EQDSK_SAVE_NR_NZ, nz=EQDSK_SAVE_NR_NZ,
+                                     truncate_eq=self._truncate_eq)
+            except Exception as exc:
+                self._log(f'save_eqdsks: save_eqdsk failed at t index {i}: {exc}')
+            else:
+                n_written += 1
+        self._log(f'save_eqdsks: wrote {n_written}/{len(self._tm_times)} gEQDSKs from loop {lp}.')
+
+    def _test_tx_geometry(self, entry):
+        r'''! Return whether TORAX accepts a geometry entry as ToraxConfig geometry.
+
+                What is validated is the whole config -- BASE_CONFIG, the user's loaded config,
+                and this geometry entry -- so a rejection is frequently not about the geometry
+                at all: one stale key anywhere in the loaded config fails every entry
+                identically. The exception is kept in _last_tx_geometry_error so callers can
+                report the actual reason instead of blaming the equilibrium.
+
+                @param entry One geometry entry, as described in @ref _tx_geometry.
+                @return True if TORAX builds a config from it.
         '''
         myconfig = copy.deepcopy(BASE_CONFIG)
         if self._loaded_config is not None:
             self._tx_config_merge(myconfig, self._loaded_config)
-        myconfig['geometry'] = {
-            'geometry_type': 'eqdsk',
-            'geometry_directory': os.getcwd(),
-            'last_surface_factor': self._last_surface_factor,
-            'Ip_from_parameters': False,
-            'geometry_file': eqdsk,
-            'cocos': self._cocos,
-        }
+        myconfig['geometry'] = self._tx_geometry({self._t_init: entry},
+                                                 Ip_from_parameters=False)
         try:
             _ = torax.ToraxConfig.from_dict(myconfig)
+            self._last_tx_geometry_error = None
             return True
         except Exception as e:
-            if not quiet and self._output_mode == 'debug':
-                self._log(f"TEST EQDSK FAILED: {eqdsk} — {repr(e)}")
-                self._print(f'    EQDSK rejected by TORAX: {os.path.basename(eqdsk)}')
+            self._last_tx_geometry_error = e
+            what = entry.get('geometry_file', 'flux surface averages')
+            self._log(f'TEST GEOMETRY FAILED: {what} — {repr(e)}')
+            if self._output_mode == 'debug':
+                self._print(f'    Geometry rejected by TORAX: {os.path.basename(str(what))}')
             return False
+
+    def _tx_geometry_error_detail(self):
+        r'''! Reason text for the last _test_tx_geometry failure, for appending to a raise.
+
+                Empty when nothing was recorded. The pointer to the loaded config is there
+                because the whole config is validated in that test, so the usual cause of a
+                rejection is a config key TORAX has renamed or removed, not the equilibrium.
+        '''
+        err = getattr(self, '_last_tx_geometry_error', None)
+        if err is None:
+            return ''
+        return (f'\nTORAX rejected the config with:\n{err}\n\n'
+                'Note this validates the entire TORAX config, not only the geometry, so the '
+                'cause is often a stale key in the config passed to load_TORAX_config rather '
+                'than a problem with the equilibrium.')
 
     def _capture_relax_tx_profiles_from_datatree(self, data_tree, time_val=None):
         r'''! Store psi, n_e, T_e, T_i at time_val for debug relax figures / history.
@@ -2887,17 +3040,17 @@ class TokaMaker_TORAX:
                 i += 1
         return None
 
-    def _run_tx_relax(self, *, stage, eqdsk_path, prescribed_profiles):
-        r'''! Short TORAX relax: initial run on the seed EQDSK, or inter-loop on TM i=0 EQDSK.
+    def _run_tx_relax(self, *, stage, geometry, prescribed_profiles):
+        r'''! Short TORAX relax: initial run on the seed, or inter-loop on the TM i=0 equilibrium.
 
                 Uses flattened user inputs (_apply_tx_set_overrides + _flatten_time_dependent).
-                If prescribed_profiles is None, psi follows EQDSK initial_psi_mode='geometry'
+                If prescribed_profiles is None, psi follows initial_psi_mode='geometry'
                 and n_e, T_e, T_i stay as already merged from base / loaded config and
                 _apply_tx_set_overrides (user inputs). If a dict is passed, it must supply
                 psi, n_e, T_e, T_i tuples (advanced; loop N relax uses None so kinetics are always user-specified).
 
                 @param stage 'initial' or 'interloop' (logging / output names only).
-                @param eqdsk_path Path to gEQDSK for geometry_configs at t_initial.
+                @param geometry Geometry entry (see @ref _tx_geometry) used at t_initial.
                 @param prescribed_profiles None, or dict with keys psi, n_e, T_e, T_i (3-tuples).
 
         '''
@@ -2917,21 +3070,7 @@ class TokaMaker_TORAX:
 
             self._apply_tx_set_overrides(init_config)
 
-            use_path = eqdsk_path
-
-            init_config['geometry'] = {
-                'geometry_type': 'eqdsk',
-                'geometry_directory': os.getcwd(),
-                'last_surface_factor': self._last_surface_factor,
-                'n_surfaces': 50,
-                'Ip_from_parameters': True,
-                'geometry_configs': {self._t_init: {'geometry_file': use_path, 'cocos': self._cocos}},
-            }
-
-            if self._tx_grid_type == 'n_rho':
-                init_config['geometry']['n_rho'] = self._tx_grid
-            elif self._tx_grid_type == 'face_centers':
-                init_config['geometry']['face_centers'] = self._tx_grid
+            init_config['geometry'] = self._tx_geometry({self._t_init: geometry})
 
             init_config.setdefault('numerics', {})
             init_config['numerics']['t_initial'] = self._t_init
@@ -3050,21 +3189,19 @@ class TokaMaker_TORAX:
                 and not self._coupling_iteration_is_first()):
             prev_lp = self._current_loop - 1
             i_eq = (len(self._tm_times) - 1) if self._steady_state_mode else 0
-            tm_eq0 = os.path.join(self._eqdsk_dir, f'{prev_lp:03d}.{i_eq:03d}.eqdsk')
-            relax_eq = tm_eq0
-            if tm_eq0 in self._eqdsk_skip or not os.path.isfile(tm_eq0):
-                seed_eqdsk = self._init_files[0]
-                if self._test_eqdsk_tx_config(seed_eqdsk):
-                    relax_eq = seed_eqdsk
-                    self._log(
-                        f'Loop {self._current_loop}: inter-loop relax: TM EQDSK (t_idx={i_eq}) from loop {prev_lp} '
-                        f'unavailable ({os.path.basename(tm_eq0)}), using seed EQDSK.'
-                    )
-                else:
+            fsa = self._equil_fsa.get((prev_lp, i_eq))
+            relax_geo = {'equilibrium': fsa} if fsa is not None else self._seeds[0]['geometry']
+            if fsa is None:
+                if not self._test_tx_geometry(relax_geo):
                     raise ValueError(
-                        f'Loop {self._current_loop}: inter-loop relax needs {tm_eq0} but it is missing '
-                        f'or skipped and seed EQDSK is not valid for TORAX: {seed_eqdsk}'
+                        f'Loop {self._current_loop}: inter-loop relax needs the TM equilibrium at '
+                        f't index {i_eq} from loop {prev_lp}, but it is unavailable and the seed '
+                        'equilibrium is not valid for TORAX.' + self._tx_geometry_error_detail()
                     )
+                self._log(
+                    f'Loop {self._current_loop}: inter-loop relax: TM equilibrium (t_idx={i_eq}) from '
+                    f'loop {prev_lp} unavailable, using the seed.'
+                )
             self._print(
                 f'  TORAX: Running relax ({self._relax_duration:g} s) simulation...'
             )
@@ -3073,12 +3210,12 @@ class TokaMaker_TORAX:
                 prescribed_profiles = copy.deepcopy(self._steady_state_tx_seed)
                 self._log(
                     f'Loop {self._current_loop}: steady_state_mode inter-loop relax seeded from '
-                    f'previous loop t_final profiles on EQDSK {os.path.basename(relax_eq)}.'
+                    f'previous loop t_final profiles.'
                 )
             # If prescribed_profiles is None: existing behavior (user kinetics, psi from geometry).
             # In steady_state_mode with a captured seed: relax starts from previous loop t_final
-            # profiles on the final-previous-loop EQDSK, then relaxed outputs seed main TORAX.
-            self._run_tx_relax(stage='interloop', eqdsk_path=relax_eq, prescribed_profiles=prescribed_profiles)
+            # profiles on the final-previous-loop equilibrium, then relaxed outputs seed main TORAX.
+            self._run_tx_relax(stage='interloop', geometry=relax_geo, prescribed_profiles=prescribed_profiles)
 
         with self._loop0_coarse_tx_main_scope():
             myconfig = self._get_tx_config()
@@ -3096,7 +3233,7 @@ class TokaMaker_TORAX:
                 self._print(f'  TORAX: sim FAILED ({hist.sim_error})')
                 raise ValueError(f'TORAX failed to run the simulation: {hist.sim_error}')
 
-            # Capture the L/H confinement state (active in ADAPTIVE_SOURCE + formation model).
+            # Capture the L/H confinement state (active with the formation model enabled).
             self._capture_confinement_mode(state_list)
 
             try:
@@ -3343,7 +3480,6 @@ class TokaMaker_TORAX:
         from tqdm import tqdm # creates progress bars
         self._log(f"Loop {self._current_loop} TokaMaker:")
 
-        self._eqdsk_skip = []
         _loop_level_log = []
 
         n_tm = len(self._tm_times)
@@ -3548,8 +3684,7 @@ class TokaMaker_TORAX:
                         )
 
                 skip_coil_update = False
-                eq_name = os.path.join(self._eqdsk_dir, f'{self._current_loop:03d}.{i:03d}.eqdsk')
-                step_fail_msg = None  # set when TM GS succeeds but TORAX rejects all EQDSK resolutions
+                step_fail_msg = None  # set when TM GS succeeds but its geometry is unusable
 
                 solve_succeeded = False
                 level_attempts = []
@@ -3693,7 +3828,6 @@ class TokaMaker_TORAX:
                                 self._log(f'tm_diagnostic_plot (level {level_idx}) failed at i={i}: {_le}')
 
                 if not solve_succeeded:
-                    self._eqdsk_skip.append(eq_name)
                     skip_coil_update = True
                     self._log(f'\tTM: Solve failed at t={t} (all levels attempted).')
                     self._state['psi_grid_prev_tm'][i] = None  # if solve failed, set psi grid to None
@@ -3712,66 +3846,28 @@ class TokaMaker_TORAX:
 
                 tm_gs_ok = solve_succeeded
                 if solve_succeeded:
-                    # Topology is not recorded in a gEQDSK, so key it to the file being written
-                    # here: it is the only way a later loop can report whether the EQDSK it is
-                    # reading back was diverted or limited. Keyed by (loop, i) rather than i
-                    # alone so a stale value from an earlier loop can never be mistaken for
-                    # this file's. Recorded before the TORAX check, so it also covers an EQDSK
-                    # that gets written and then rejected.
+                    # The geometry handed to TORAX: flux surface averages traced on the finite
+                    # element mesh itself. Tracing can still fail on a pathological equilibrium
+                    # ("Tracing failed at psi = 0.0029"), in which case this timestep is skipped
+                    # for TORAX geometry (neighbours are interpolated in _get_tx_config) rather
+                    # than aborting the whole fly().
                     try:
-                        self._eqdsk_topology[(self._current_loop, i)] = \
-                            bool(self._state['equil'][i].diverted)
-                    except Exception as _te:
-                        self._log(f'\tTM: could not record topology at i={i}: {_te}')
-                    torax_accepted = False
-                    _eqdsk_save_err = None   # last error string if save_eqdsk raised
-                    _n_attempts = len(EQDSK_SAVE_NR_NZ_SEQUENCE)
-                    for _attempt_idx, nr_nz in enumerate(EQDSK_SAVE_NR_NZ_SEQUENCE):
-                        quiet_test = (_attempt_idx < _n_attempts - 1)
-                        # The gEQDSK core write can fail on a pathological equilibrium
-                        # (e.g. the on-axis grid: "Tracing failed at psi = 0.0029"); the
-                        # Fortran routine reports it via the error buffer and save_eqdsk
-                        # re-raises. Treat that as a failed attempt: try the next resolution,
-                        # and if every resolution raises, fall through to the _eqdsk_skip
-                        # path below (skip this timestep, TORAX interpolates neighbors)
-                        # instead of aborting the whole fly().
-                        try:
-                            with self._quiet_tm():
-                                self._state['equil'][i].save_eqdsk(eq_name,
-                                    lcfs_pad=1-self._last_surface_factor, run_info='TokaMaker EQDSK',
-                                    cocos=self._cocos, nr=nr_nz, nz=nr_nz,
-                                    truncate_eq=self._truncate_eq)
-                        except Exception as _eqdsk_exc:
-                            _eqdsk_save_err = _eqdsk_exc
-                            self._log(f'\tTM: save_eqdsk failed at nr=nz={nr_nz} for '
-                                      f'{os.path.basename(eq_name)}: {_eqdsk_exc}')
-                            continue
-                        if self._test_eqdsk_tx_config(eq_name, quiet=quiet_test):
-                            torax_accepted = True
-                            # if _attempt_idx > 0 and self._output_mode == 'debug':
-                                # base_nz = EQDSK_SAVE_NR_NZ_SEQUENCE[0]
-                                # self._print(
-                                #     f'    EQDSK {os.path.basename(eq_name)}: base nr=nz={base_nz} rejected by TORAX; '
-                                #     f'accepted at nr=nz={nr_nz}.'
-                                # )
-                            break
-                    if not torax_accepted:
-                        # Same coupling outcome as a failed TM solve: skip this time for TORAX geometry
-                        # (TORAX interpolates neighbors in _get_tx_config) instead of aborting the whole fly.
-                        self._eqdsk_skip.append(eq_name)
+                        with self._quiet_tm():
+                            fsa = self._state['equil'][i].get_fsa(
+                                psi=fsa_psi_norm(self._n_surfaces, self._last_surface_factor))
+                    except Exception as _fsa_exc:
+                        step_fail_msg = f'get_fsa failed at t index {i}: {_fsa_exc}'
+                    else:
+                        if self._test_tx_geometry({'equilibrium': fsa}):
+                            self._equil_fsa[(self._current_loop, i)] = fsa
+                            self._tm_stats[(self._current_loop, i)] = \
+                                _tm_solve_stats(self._state['equil'][i], fsa)
+                        else:
+                            step_fail_msg = (f'TORAX rejected the flux surface averages at t index {i}'
+                                             + self._tx_geometry_error_detail())
+                    if step_fail_msg is not None:
                         skip_coil_update = True
                         self._state['psi_grid_prev_tm'][i] = None
-                        if _eqdsk_save_err is not None:
-                            step_fail_msg = (
-                                f'save_eqdsk raised at every nr=nz in '
-                                f'{EQDSK_SAVE_NR_NZ_SEQUENCE} ({_eqdsk_save_err}): '
-                                f'{os.path.basename(eq_name)}'
-                            )
-                        else:
-                            step_fail_msg = (
-                                f'TORAX rejected EQDSK after save attempts nr=nz in '
-                                f'{EQDSK_SAVE_NR_NZ_SEQUENCE}: {os.path.basename(eq_name)}'
-                            )
                         self._log(f'\tTM: {step_fail_msg}')
                         solve_succeeded = False
                     else:
@@ -3852,7 +3948,7 @@ class TokaMaker_TORAX:
                     _pbar.set_postfix_str(f't={t:.2f}s OK(L{lvl})', refresh=False)
                 else:
                     err_short = (step_fail_msg or _last_attempt.get('error') or 'unknown')[:60]
-                    _fail_tag = 'TORAX EQDSK' if step_fail_msg else 'TM'
+                    _fail_tag = 'TORAX geometry' if step_fail_msg else 'TM'
                     tqdm.write(f'    WARNING: {_fail_tag} FAIL at t={t:.2f}s — {err_short}')
                     self._log(f'    {_fail_tag} FAIL at t={t:.2f}s — {err_short}')
                     _pbar.set_postfix_str(f't={t:.2f}s FAIL', refresh=False)
@@ -4328,7 +4424,7 @@ class TokaMaker_TORAX:
     # =========================================================================
 
     def fly(self, run_name='tmp', convergence_threshold=-1.0, max_loop=3,
-            output_mode=False, skip_bad_init_eqdsks=False,
+            output_mode=False, skip_bad_init_eqdsks=False, save_eqdsks=False,
             initial_relax=True, relax=False, relax_kinetics=False, relax_duration=1.0, relax_dt=0.1,
             t_ave_toggle='off', t_ave_window=0.5, t_ave_causal=True, t_ave_ignore_start=0.25,
             loop0=False, steady_state_mode=False):
@@ -4354,16 +4450,14 @@ class TokaMaker_TORAX:
                 
                        False / None — No output directory. Log only (TokaMaker_TORAX_log_tmp.log or
                        TokaMaker_TORAX_log_{run_name}_{timestamp}.log in cwd). No plots or config files.
-                       TokaMaker gEQDSK files use a temporary directory and are deleted at exit.
-                
+
                        'minimal' — Per completed coupling loop: scalars_loop{N}.png,
                        PLH_components_loop{N}.png. At end of run (non-Jupyter): profile_evolution.png,
                        lcfs_evolution.png, movie_loop{N}.mp4 (N = last completed loop index).
                        On TokaMaker GS failure at a timestep: tm_diag_loop{N}_tidx{i}.png. On TORAX
                        failure: scalars_loop{N}_torax_failed.png and, if partial TORAX data exist,
                        profile_loop{N}_torax_failed_tfinal.png. No TORAX config .py files, no
-                       per-timestep profile plots, no relax-profile figures, no persisted gEQDSK files
-                       (temporary EQDSK dir removed at exit).
+                       per-timestep profile plots, no relax-profile figures.
                 
                        'normal' (also output_mode=True) — Per loop: scalars_loop{N}.png,
                        PLH_components_loop{N}.png; tx_config_loop{N}.py; initial / inter-loop relax
@@ -4371,25 +4465,28 @@ class TokaMaker_TORAX:
                        successful TokaMaker timestep profile_loop{N}_tidx{i}.png. At end (non-Jupyter):
                        profile_evolution.png and movie_loop{N}.mp4 (no lcfs_evolution.png).
                        Same failure plots as minimal. No tm_diag on successful solves, no
-                       relax-profile figures, no tm_summary_loop{N}.png, no persisted gEQDSK files.
+                       relax-profile figures, no tm_summary_loop{N}.png.
                 
-                       'debug' — All normal artifacts plus lcfs_evolution.png at end of run. gEQDSK files
-                       {loop:03d}.{i:03d}.eqdsk are kept in the output directory (not deleted).
+                       'debug' — All normal artifacts plus lcfs_evolution.png at end of run.
                        Initial / inter-loop relax: tx_relax_profiles_initial.png,
                        tx_relax_profiles_inter_loop{N}.png. Every TokaMaker timestep (success or fail):
                        tm_diag_loop{N}_tidx{i}.png (successful solves also get profile_loop{N}_tidx{i}.png).
                        After each loop: tm_summary_loop{N}.png. Python logging (TORAX, JAX, etc.) is
                        redirected to the log file; per-loop wall time is printed.
-                @param skip_bad_init_eqdsks If True, skip broken initial gEQDSK files instead of raising.
-                @param initial_relax If True (default), run a short TORAX relax on the seed EQDSK before
+                @param skip_bad_init_eqdsks If True, skip seed equilibria TORAX rejects instead of raising.
+                @param save_eqdsks If True, write a gEQDSK per TokaMaker timestep of the final loop into
+                       the output directory ({loop:03d}.{i:03d}.eqdsk). Diagnostic output only: the
+                       coupling passes flux surface averages between the codes and never reads these
+                       back. Requires an output directory (output_mode not False).
+                @param initial_relax If True (default), run a short TORAX relax on the seed equilibrium before
                        the first coupling TM-TORAX pass (flattened user inputs; psi from geometry unless an
-                       inter-loop relax already set psi). If False, skip and start from EQDSK psi / loaded config.
+                       inter-loop relax already set psi). If False, skip and start from geometry psi / loaded config.
                        When relax is True, this is forced True so initial relax establishes psi before
                        later coupling iterations.
                 @param relax If True, run an additional short TORAX relax before each coupling iteration
-                       with index ≥1, on TM-solved EQDSK (previous_loop).000.eqdsk (fallback: seed), with **user**
-                       n_e, T_e, T_i from loaded config and set_*() and psi from geometry on that EQDSK—
-                       avoiding drift from previous TORAX outputs between loops.
+                       with index ≥1, on the previous loop's TokaMaker equilibrium at t index 0 (fallback:
+                       seed), with **user** n_e, T_e, T_i from loaded config and set_*() and psi from that
+                       geometry—avoiding drift from previous TORAX outputs between loops.
                        Default False (backward compatible). Implies initial_relax=True.
                 @param relax_kinetics If False (default), each relax only evolves current; density and
                        ion/electron heat stay fixed at the profiles present before that relax. If True,
@@ -4411,16 +4508,14 @@ class TokaMaker_TORAX:
                        (stride 2). If False (default), skip that pass and start coupling at index 1 at full resolution
                        (initial relax is unchanged and controlled only by initial_relax / relax).
                 @param steady_state_mode If False (default), each coupling loop after the first reuses the
-                       time-dependent TokaMaker EQDSK sequence from the previous loop (existing behavior).
+                       time-dependent TokaMaker equilibrium sequence from the previous loop (existing behavior).
                        If True, after each completed loop the next loop seeds TORAX with psi and kinetics from
-                       the previous main run at t_final, uses the final TokaMaker EQDSK from the
+                       the previous main run at t_final, uses the final TokaMaker equilibrium from the
                        previous loop for all TORAX geometry times (flat equilibrium shape in time), warm-starts
                        TokaMaker at i=0 from the previous loop's final psi grid, and runs inter-loop relax
-                       on that final EQDSK when relax is True.
+                       on that final equilibrium when relax is True.
 
         '''
-        import tempfile
-
         if relax:
             initial_relax = True
 
@@ -4514,13 +4609,9 @@ class TokaMaker_TORAX:
             self._logging_configured = False
             self.configure_redirect_to_log()
 
-        # ── EQDSK directory: persisted only for debug mode ──
-        if self._output_mode == 'debug':
-            self._eqdsk_dir = self._out_dir
-            self._eqdsk_dir_is_temp = False
-        else:
-            self._eqdsk_dir = tempfile.mkdtemp(prefix='TokaMaker_TORAX_equil_')
-            self._eqdsk_dir_is_temp = True
+        self._save_eqdsks = bool(save_eqdsks) and self._out_dir is not None
+        if save_eqdsks and self._out_dir is None:
+            self._log('save_eqdsks requested but there is no output directory; nothing will be written.')
 
         # ── Diverted / saddle-point configuration (set via set_diverted_shape_targets) ──
         if self._diverted_times is not None and self._x_point_targets is not None:
@@ -4547,6 +4638,7 @@ class TokaMaker_TORAX:
 
         err = convergence_threshold + 1.0
         cflux_tx_prev = 0.0
+        self._loop_timings = []
         tm_cflux_psi = []
         tm_cflux_vloop = []
         tx_cflux_psi = []
@@ -4560,10 +4652,11 @@ class TokaMaker_TORAX:
                 self._print(f'\n{"="*60}\n  Initial TORAX relax\n{"="*60}')
                 if self._relax_kinetics:
                     self._print('  Initial relax: relax_kinetics ON (evolve_* from set_evolve / config)')
-                init_seed = self._init_files[0]
-                if not self._test_eqdsk_tx_config(init_seed):
-                    raise ValueError(f'Initial TORAX relax: first seed EQDSK not valid for TORAX: {init_seed}')
-                self._run_tx_relax(stage='initial', eqdsk_path=init_seed, prescribed_profiles=None)
+                init_seed = self._seeds[0]['geometry']
+                if not self._test_tx_geometry(init_seed):
+                    raise ValueError('Initial TORAX relax: first seed equilibrium not valid for '
+                                     'TORAX.' + self._tx_geometry_error_detail())
+                self._run_tx_relax(stage='initial', geometry=init_seed, prescribed_profiles=None)
             else:
                 self._psi_init = None
                 self._psi_init_seed = None
@@ -4584,9 +4677,19 @@ class TokaMaker_TORAX:
                 self._print(f'\n{"="*60}\n  Loop {self._current_loop}\n{"="*60}')
 
                 _t_coupling_loop0 = time.perf_counter()
+                _dt_tx = None
+                _dt_tm = None
                 try:
                     cflux_tx, cflux_tx_vloop = self._run_tx()
+                    _dt_tx = time.perf_counter() - _t_coupling_loop0
                 except Exception as _tx_exc:
+                    _dt_tx = time.perf_counter() - _t_coupling_loop0
+                    self._print(
+                        f'  Loop {self._current_loop} timing: '
+                        f'TORAX {_fmt_duration(_dt_tx)} (failed) | TokaMaker not run'
+                    )
+                    self._loop_timings.append({'loop': self._current_loop, 'torax': _dt_tx,
+                                               'tokamaker': None, 'total': _dt_tx})
                     # On any TORAX failure (e.g. temperature collapse), save the scalar
                     # plot so the user has TM/TX time-series up to the failure point.
                     # TokaMaker entries plot as zeros / prior-loop values; that's expected.
@@ -4643,7 +4746,7 @@ class TokaMaker_TORAX:
                                             )
                                             self._print(
                                                 '  TORAX failed; profile plot (last TORAX save) skipped '
-                                                '(no TM profiles and no seed EQDSK profiles for this index).'
+                                                '(no TM profiles and no seed profiles for this index).'
                                             )
                                             i_prof = None
                                     if i_prof is not None:
@@ -4694,7 +4797,9 @@ class TokaMaker_TORAX:
                             )
                     raise
 
+                _t_tm_start = time.perf_counter()
                 cflux_tm, cflux_tm_vloop = self._run_tm()
+                _dt_tm = time.perf_counter() - _t_tm_start
 
                 tm_cflux_psi.append(cflux_tm)
                 tm_cflux_vloop.append(cflux_tm_vloop)
@@ -4704,11 +4809,20 @@ class TokaMaker_TORAX:
                 err = np.abs(cflux_tx - cflux_tx_prev) / cflux_tx_prev if cflux_tx_prev != 0 else convergence_threshold + 1.0
                 cflux_diff = np.abs(cflux_tx - cflux_tm) / cflux_tm * 100.0 if cflux_tm != 0 else np.inf
 
-                self._print(f'  Loop {self._current_loop} result: conv_err={err*100:.3f}% | '
-                              f'TX-TM diff={cflux_diff:.4f}% | '
-                              f'cflux_TX={cflux_tx:.4f} Wb | cflux_TM={cflux_tm:.4f} Wb')
-                self._log(f'TX Convergence error = {err*100.0:.3f} %')
-                self._log(f'Difference Convergence error = {cflux_diff:.4f} %')
+                # Consumed-flux convergence reporting is parked while the convergence
+                # criterion is being reworked. `err` still drives the while-loop exit.
+                # self._print(f'  Loop {self._current_loop} result: conv_err={err*100:.3f}% | '
+                #               f'TX-TM diff={cflux_diff:.4f}% | '
+                #               f'cflux_TX={cflux_tx:.4f} Wb | cflux_TM={cflux_tm:.4f} Wb')
+                # self._log(f'TX Convergence error = {err*100.0:.3f} %')
+                # self._log(f'Difference Convergence error = {cflux_diff:.4f} %')
+
+                # Per-step wall times, emitted every loop in every output mode so the
+                # TORAX/TokaMaker cost split is always recoverable from the log.
+                self._print(f'  Loop {self._current_loop} timing: '
+                            f'TORAX {_fmt_duration(_dt_tx)} | TokaMaker {_fmt_duration(_dt_tm)}')
+                self._loop_timings.append({'loop': self._current_loop, 'torax': _dt_tx,
+                                           'tokamaker': _dt_tm, 'total': None})
 
                 # Coupling error metrics: compute once per loop (fills the err_* state
                 # arrays) so they are available to plot_errors and to save_state, even
@@ -4786,25 +4900,22 @@ class TokaMaker_TORAX:
                     except Exception as _e:
                         self._log(f'plot_coil_current_tunnel failed at loop {self._current_loop}: {_e}')
 
-                if self._output_mode == 'debug':
-                    _loop_elapsed = time.perf_counter() - _t_coupling_loop0
-                    _loop_mins, _loop_secs = divmod(_loop_elapsed, 60)
-                    self._print(
-                        f'  Loop {self._current_loop} wall time: '
-                        f'{int(_loop_mins)}m {_loop_secs:.1f}s'
-                    )
+                _loop_elapsed = time.perf_counter() - _t_coupling_loop0
+                if self._loop_timings:
+                    self._loop_timings[-1]['total'] = _loop_elapsed
+                self._print(
+                    f'  Loop {self._current_loop} wall time: {_fmt_duration(_loop_elapsed)} '
+                    f'(TORAX {_fmt_duration(_dt_tx)}, TokaMaker {_fmt_duration(_dt_tm)}, '
+                    f'other {_fmt_duration(max(_loop_elapsed - (_dt_tx or 0.0) - (_dt_tm or 0.0), 0.0))})'
+                )
 
                 cflux_tx_prev = cflux_tx
                 self._current_loop += 1
 
         finally:
-            # ── Cleanup temp EQDSK directory ──
-            if getattr(self, '_eqdsk_dir_is_temp', False) and hasattr(self, '_eqdsk_dir') and os.path.exists(self._eqdsk_dir):
-                try:
-                    shutil.rmtree(self._eqdsk_dir)
-                except OSError:
-                    pass
-
+            # ── Optional gEQDSK dump of the final loop's equilibria (diagnostic only) ──
+            if self._save_eqdsks:
+                self._write_eqdsks()
 
         self._current_loop -= 1 # adjust back to last completed loop for reporting
         # ── End-of-run mode-specific outputs ──
@@ -4844,18 +4955,28 @@ class TokaMaker_TORAX:
         _loop_label0 = 0 if _coupling_loop0 else 1
         converged = err <= convergence_threshold
         self._print(f'\n{"="*60}')
+        # Consumed-flux convergence reporting is parked while the convergence criterion
+        # is being reworked; the run still stops on `err` / max_loop as before.
+        # if converged:
+        #     self._print(f'  CONVERGED in {n_completed} loops (err={err*100:.3f}%)')
+        # else:
+        #     self._print(f'  Max loop index ({max_loop}) reached (err={err*100:.3f}%)')
         if converged:
-            self._print(f'  CONVERGED in {n_completed} loops (err={err*100:.3f}%)')
+            self._print(f'  Finished after {n_completed} loops')
         else:
-            self._print(f'  Max loop index ({max_loop}) reached (err={err*100:.3f}%)')
+            self._print(f'  Max loop index ({max_loop}) reached')
 
-        # Print convergence history
-        self._print(f'\n  {"Loop":<6} {"cflux TX [Wb]":<16} {"cflux TM [Wb]":<16} {"TX-TM diff %":<14}')
-        self._print(f'  {"-"*52}')
-        for s in range(len(tx_cflux_psi)):
-            diff_pct = np.abs(tx_cflux_psi[s] - tm_cflux_psi[s]) / tm_cflux_psi[s] * 100 if tm_cflux_psi[s] != 0 else np.inf
+        # Per-loop timing history
+        _timings_by_loop = {t['loop']: t for t in getattr(self, '_loop_timings', [])}
+        self._print(f'\n  {"Loop":<6} {"t TORAX":<14} {"t TokaMaker":<14} {"t loop":<14}')
+        self._print(f'  {"-"*50}')
+        for s in range(n_completed):
+            # diff_pct = np.abs(tx_cflux_psi[s] - tm_cflux_psi[s]) / tm_cflux_psi[s] * 100 if tm_cflux_psi[s] != 0 else np.inf
             _idx = _loop_label0 + s
-            self._print(f'  {_idx:<6} {tx_cflux_psi[s]:<16.4f} {tm_cflux_psi[s]:<16.4f} {diff_pct:<14.4f}')
+            _tm_t = _timings_by_loop.get(_idx, {})
+            self._print(f'  {_idx:<6} {_fmt_duration(_tm_t.get("torax")):<14} '
+                        f'{_fmt_duration(_tm_t.get("tokamaker")):<14} '
+                        f'{_fmt_duration(_tm_t.get("total")):<14}')
         self._print(f'{"="*60}')
 
         # ── End-of-flattop physics summary (always printed to terminal + log) ──
@@ -5102,9 +5223,9 @@ class TokaMaker_TORAX:
             'current': self._evolve_current,
         }
 
-        # Seed eqdsks: a faithful replay should redo exactly what the original run did.
+        # Seeds: a faithful replay should redo exactly what the original run did.
         #   - If this run CREATED its seeds (original create_seed_eqdsks=True), keep that
-        #     flag True so replay regenerates them from the trajectory inputs (preserved in
+        #     flag True so replay re-solves them from the trajectory inputs (preserved in
         #     the stashed seed_eqdsk_config). Do NOT embed g_eqdsk_arr file paths.
         #   - If the seeds were originally PASSED in (loaded, not created), keep that:
         #     create_seed_eqdsks=False and embed the absolute file paths used this run.
@@ -5115,10 +5236,11 @@ class TokaMaker_TORAX:
         seed_cfg['eq_times'] = [float(t) for t in self._eqtimes]
         if seeds_were_created:
             seed_cfg['create_seed_eqdsks'] = True
-            tmtx_dict.pop('g_eqdsk_arr', None)  # regenerated on replay, not loaded
+            tmtx_dict.pop('g_eqdsk_arr', None)  # re-solved on replay, not loaded
         else:
             seed_cfg['create_seed_eqdsks'] = False
-            tmtx_dict['g_eqdsk_arr'] = [os.path.abspath(p) for p in self._init_files]
+            tmtx_dict['g_eqdsk_arr'] = [s['geometry']['geometry_file'] for s in self._seeds
+                                        if 'geometry_file' in s['geometry']]
         tmtx_dict['seed_eqdsk_config'] = seed_cfg
 
         tmtx_dict = self._numpy_to_plain_python_keep_arrays(tmtx_dict)
@@ -5271,15 +5393,14 @@ class TokaMaker_TORAX:
             lp = int(getattr(self, '_current_loop', -1))
             fname = f'TokaMaker_TORAX_final_loop{lp:03d}_t{t:.6f}s.eqdsk'
             eqdsk_path = os.path.join(out_dir, fname)
-            nr_nz = EQDSK_SAVE_NR_NZ_SEQUENCE[-1]
             with self._quiet_tm():
                 equil.save_eqdsk(
                     eqdsk_path,
                     lcfs_pad=1.0 - self._last_surface_factor,
                     run_info='TokaMaker EQDSK (TokaMaker_TORAX final timepoint)',
                     cocos=self._cocos,
-                    nr=nr_nz,
-                    nz=nr_nz,
+                    nr=EQDSK_SAVE_NR_NZ,
+                    nz=EQDSK_SAVE_NR_NZ,
                     truncate_eq=self._truncate_eq,
                 )
 
@@ -5740,8 +5861,18 @@ def _fmt_saved_artifact_link(path):
         return abs_path
 
 
+def _fmt_duration(seconds):
+    r'''! Wall-clock duration as "Xm Y.Zs" (or "X.Ys" under a minute).'''
+    if seconds is None:
+        return '--'
+    mins, secs = divmod(round(float(seconds), 1), 60)
+    if mins >= 1:
+        return f'{int(mins)}m {secs:.1f}s'
+    return f'{secs:.1f}s'
+
+
 def _seed_tm_profiles_for_failure_profile_plot(tt, i):
-    r'''! Fill TM comparison fields for profile_plot from seed EQDSK/GS inputs when TM has not run at index i.'''
+    r'''! Fill TM comparison fields for profile_plot from the seed/GS inputs when TM has not run at index i.'''
     s = tt._state
     if i in s.get('pp_prof_tm', {}):
         return True
@@ -6166,12 +6297,12 @@ def _eval_ibc_at_time(spec, t):
 
 # ── TokaMaker diagnostic plot ─────────────────────────────────────────────────
 
-def _eqdsk_shape_stats(rz):
+def _contour_shape_stats(rz):
     r'''! Geometric shape parameters (R_geo, a_geo, kappa, delta) from an LCFS contour [:,2].
 
         Uses the LCFS-extrema convention, matching TokaMaker `get_stats(geom_type='max')`, so
-        values derived here for an EQDSK are comparable to TokaMaker's own. Returns an empty
-        dict for a contour that is missing or degenerate.
+        values derived here are comparable to TokaMaker's own. Returns an empty dict for a
+        contour that is missing or degenerate.
     '''
     if rz is None:
         return {}
@@ -6194,48 +6325,49 @@ def _eqdsk_shape_stats(rz):
     }
 
 
-def _last_solve_eqdsk_stats(tt, i):
-    r'''! Scalars read back from the gEQDSK the previous loop's TM solve wrote at timestep i.
+def _tm_solve_stats(equil, fsa):
+    r'''! Scalars describing the geometry a TokaMaker solve handed TORAX.
 
-        That file is the geometry TORAX consumed for the current loop, so it is the "last solve"
-        reference the diagnostic table compares against. Returns an empty dict on loop 1, or when
-        the file is absent because the solve failed before it could be written.
+        Recorded at solve time (see _run_tm) so a later loop can show what it is comparing
+        against. Shape uses the outermost traced surface and the LCFS-extrema convention,
+        matching TokaMaker `get_stats(geom_type='max')`, as @ref _contour_shape_stats does
+        for the seed.
     '''
-    eq_dir = getattr(tt, '_eqdsk_dir', None)
-    if eq_dir is None or tt._current_loop < 2:
-        return {}
-    path = os.path.join(eq_dir, f'{tt._current_loop - 1:03d}.{i:03d}.eqdsk')
-    if not os.path.isfile(path):
-        return {}
-    try:
-        g = read_eqdsk(path)
-    except Exception:
-        return {}
-    q = np.asarray(g['qpsi'], dtype=float)
-    psi_eqdsk = np.linspace(0.0, 1.0, g['nr'])
-    out = {
-        'Ip': abs(float(g['ip'])),
-        'pax': abs(float(g['pres'][0])),
-        # Written by save_eqdsk(cocos=2), which negates TM-native psi; flip back to match _state.
-        'psi_lcfs': -float(g['psibry']),
+    a_geo = float(fsa['R_max'][-1] - fsa['R_min'][-1]) / 2.0
+    R_geo = float(fsa['R_max'][-1] + fsa['R_min'][-1]) / 2.0
+    q = np.asarray(fsa['q'], dtype=float)
+    return {
+        'Ip': abs(float(equil.get_globals()[0])),
+        'pax': abs(float(equil.get_profiles(psi=np.zeros(1))[3][0])),
+        'psi_lcfs': float(fsa['psi_boundary']),
         'q0': float(q[0]),
-        'q95': float(np.interp(0.95, psi_eqdsk, q)),
+        'q95': float(np.interp(0.95, np.asarray(fsa['psi_norm'], dtype=float), q)),
+        'R_geo': R_geo,
+        'a_geo': a_geo,
+        'kappa': float(fsa['Z_max'][-1] - fsa['Z_min'][-1]) / (2.0 * a_geo),
+        'delta': (R_geo - float(fsa['R_at_Zmax'][-1] + fsa['R_at_Zmin'][-1]) / 2.0) / a_geo,
+        'topology': 'diverted' if fsa['diverted'] else 'limited',
     }
-    out.update(_eqdsk_shape_stats(g['rzout']))
-    # A gEQDSK stores no topology flag, so take it from what TokaMaker reported when it wrote
-    # this file (keyed by the same loop and timestep).
-    _div = getattr(tt, '_eqdsk_topology', {}).get((tt._current_loop - 1, i))
-    if _div is not None:
-        out['topology'] = 'diverted' if _div else 'limited'
-    return out
+
+
+def _last_solve_stats(tt, i):
+    r'''! Stats for the equilibrium the previous loop's TM solve handed TORAX at timestep i.
+
+        That equilibrium is the geometry TORAX consumed for the current loop, so it is the
+        "last solve" reference the diagnostic table compares against. Returns an empty dict on
+        loop 1, or when that solve failed.
+    '''
+    if tt._current_loop < 2:
+        return {}
+    return dict(tt._tm_stats.get((tt._current_loop - 1, i), {}))
 
 
 def _tm_diag_tm_column(tt, i, gs_ok, solve_succeeded, succeeded_profile):
     r'''! TokaMaker column values for the diagnostic table at timestep i.
 
         Everything is read from this timestep's equilibrium object rather than the `*_tm` state
-        arrays, because `_tm_update` only runs once the EQDSK is also accepted -- on a rejected
-        EQDSK the state arrays still hold the previous loop's values for this index. Keys absent
+        arrays, because `_tm_update` only runs once the geometry is also accepted -- when it is
+        rejected the state arrays still hold the previous loop's values for this index. Keys absent
         from the returned dict render blank, so a failed GS solve yields only the solver settings.
     '''
     out = {}
@@ -6399,11 +6531,11 @@ def tm_diagnostic_plot(tt, i, t, level_attempts, solve_succeeded, save_path=None
         Success and failure produce the same layout; cells with no value available (all TokaMaker
         results on a failed GS solve) render as an em dash.
 
-        @param solve_succeeded Whether the full TM timestep succeeded including EQDSK validation
+        @param solve_succeeded Whether the full TM timestep succeeded including geometry validation
                for TORAX (same flag as after `_run_tm` updates).
-        @param tm_gs_ok Whether the Grad-Shafranov solve succeeded (independent of EQDSK).
+        @param tm_gs_ok Whether the Grad-Shafranov solve succeeded (independent of the geometry).
                If None, inferred from level_attempts.
-        @param step_error Optional failure string (e.g. TORAX EQDSK rejection); overrides parsing
+        @param step_error Optional failure string (e.g. TORAX geometry rejection); overrides parsing
                the last level attempt when provided.
     '''
     s = tt._state
@@ -6533,7 +6665,7 @@ def tm_diagnostic_plot(tt, i, t, level_attempts, solve_succeeded, save_path=None
     def _not_jphi(att):
         return not _is_jphi_attempt(att)
 
-    _plot_levels(ax_ffp_tx, 'ffp', seed_x=_seed_ffp_x, seed_y=_seed_ffp_norm, seed_label="FF' seed EQDSK (norm)", level_filter=_not_jphi)
+    _plot_levels(ax_ffp_tx, 'ffp', seed_x=_seed_ffp_x, seed_y=_seed_ffp_norm, seed_label="FF' seed (norm)", level_filter=_not_jphi)
     if _prev_ffp_prof is not None:
         _pffp_y = np.asarray(_prev_ffp_prof['y'], dtype=float)
         _pffp_peak = np.max(np.abs(_pffp_y))
@@ -6547,7 +6679,7 @@ def tm_diagnostic_plot(tt, i, t, level_attempts, solve_succeeded, save_path=None
     ax_ffp_tx.grid(True, alpha=0.3)
     ax_ffp_tx.axhline(0, color='k', linewidth=0.5)
 
-    _plot_levels(ax_pp_tx, 'pp', seed_x=_seed_pp_x, seed_y=_seed_pp_norm, seed_label="p' seed EQDSK (norm)")
+    _plot_levels(ax_pp_tx, 'pp', seed_x=_seed_pp_x, seed_y=_seed_pp_norm, seed_label="p' seed (norm)")
     if _prev_pp_prof is not None:
         _ppp_y = np.asarray(_prev_pp_prof['y'], dtype=float)
         _ppp_peak = np.max(np.abs(_ppp_y))
@@ -6641,8 +6773,8 @@ def tm_diagnostic_plot(tt, i, t, level_attempts, solve_succeeded, save_path=None
         'q95': q95_seed_eq,
         'q0': q0_seed_eq,
     }
-    col_seed.update(_eqdsk_shape_stats(s.get('lcfs_geo', {}).get(i)))
-    col_last = _last_solve_eqdsk_stats(tt, i)
+    col_seed.update(_contour_shape_stats(s.get('lcfs_geo', {}).get(i)))
+    col_last = _last_solve_stats(tt, i)
     col_tx = {
         'Ip': Ip_tx,
         'pax': pax_tx,
@@ -6692,7 +6824,7 @@ def tm_diagnostic_plot(tt, i, t, level_attempts, solve_succeeded, save_path=None
             return '\u2014'
 
     _table_rows = [[
-        'Parameter', 'Seed\nEQDSK', f'Last EQDSK\n(loop {tt._current_loop - 1})',
+        'Parameter', 'Seed', f'Last solve\n(loop {tt._current_loop - 1})',
         f'TORAX\n(loop {tt._current_loop})', f'TokaMaker\n(loop {tt._current_loop})',
     ]]
     for _label, _key, _fmt in _rows_spec:
@@ -6765,7 +6897,7 @@ def tm_diagnostic_plot(tt, i, t, level_attempts, solve_succeeded, save_path=None
     if solve_succeeded:
         _status, _status_color = 'TokaMaker: SUCCESS', 'darkgreen'
     elif _gs_ok:
-        _status, _status_color = 'TM GS OK \u2014 coupling failed (e.g. TORAX rejected EQDSK)', 'darkorange'
+        _status, _status_color = 'TM GS OK \u2014 coupling failed (e.g. TORAX rejected the geometry)', 'darkorange'
     else:
         _status, _status_color = 'TokaMaker: FAILED', 'darkred'
     plt.suptitle(
@@ -7068,7 +7200,7 @@ def plot_tx_relax_profiles(
     r'''! Plot psi, n_e, T_e, T_i vs rho_norm after a short TORAX relax.
 
         Shows main-run history (tt._relax_mainrun_profile_history), **user** kinetic
-        profiles from flattened profile_conditions, **init EQDSK** psi at t_initial
+        profiles from flattened profile_conditions, **initial geometry** psi at t_initial
         when psi is not prescribed (initial_psi_mode='geometry'), and the profile at
         t_final_relax. Used when TokaMaker_TORAX.fly(..., output_mode='debug').
 
@@ -7085,7 +7217,7 @@ def plot_tx_relax_profiles(
         _relax_loop = tt._current_loop
     _stage_lbl = f'Loop {_relax_loop} relax'
     fig.suptitle(
-        f'TORAX {_stage_lbl}: history, user inputs, init EQDSK psi, after relax',
+        f'TORAX {_stage_lbl}: history, user inputs, initial geometry psi, after relax',
         fontsize=11,
     )
     _cmap_hist = plt.get_cmap('tab10')
@@ -7153,7 +7285,7 @@ def plot_tx_relax_profiles(
                         ls='-.',
                         color=_eqdsk_psi_color,
                         alpha=0.95,
-                        label=r'init EQDSK $\psi$ (seed)',
+                        label=r'init geometry $\psi$ (seed)',
                     )
                 except Exception:
                     pass
@@ -9135,7 +9267,7 @@ def summary(tt):
 # =============================================================================
 
 def run_tmtx_from_config(tmtx_config=None, torax_config=None, config_file=None, save_dir=None):
-    r'''! Full TokaMaker_TORAX run from config dicts: seed eqdsk creation, object
+    r'''! Full TokaMaker_TORAX run from config dicts: seed equilibrium creation, object
             initialization, and simulation.
 
             Two ways to call:
@@ -9181,15 +9313,12 @@ def run_tmtx_from_config(tmtx_config=None, torax_config=None, config_file=None, 
         seed_dir = None
         seed_cfg = tmtx_config.get('seed_eqdsk_config', {})
         if seed_cfg.get('create_seed_eqdsks', False):
-            tmtx_config['g_eqdsk_arr'] = _create_seed_eqdsks(tmtx_config, mygs)
-            # Staging folder the seeds were written into (parent of the first seed file).
-            if tmtx_config['g_eqdsk_arr']:
-                seed_dir = os.path.dirname(tmtx_config['g_eqdsk_arr'][0])
-                # In debug mode the seeds are staged directly in the cwd (not a temp dir), so
-                # there is no temp parent to remove — the folder is only ever moved into the
-                # output dir below. Otherwise track the mkdtemp() parent for finally cleanup.
-                if not _output_mode_is_debug(tmtx_config.get('fly_kwargs', {}).get('output_mode')):
-                    seed_tmp_parent = os.path.dirname(seed_dir)  # the mkdtemp() parent to clean up
+            tmtx_config['g_eqdsk_arr'], seed_dir = _create_seed_equilibria(tmtx_config, mygs)
+            # In debug mode the seed figures are staged directly in the cwd (not a temp dir), so
+            # there is no temp parent to remove — the folder is only ever moved into the
+            # output dir below. Otherwise track the mkdtemp() parent for finally cleanup.
+            if not _output_mode_is_debug(tmtx_config.get('fly_kwargs', {}).get('output_mode')):
+                seed_tmp_parent = os.path.dirname(seed_dir)  # the mkdtemp() parent to clean up
         elif not tmtx_config.get('g_eqdsk_arr'):
             raise ValueError(
                 "seed_eqdsk_config['create_seed_eqdsks'] is False but no 'g_eqdsk_arr' "
@@ -9200,11 +9329,9 @@ def run_tmtx_from_config(tmtx_config=None, torax_config=None, config_file=None, 
 
         tmtx.fly(run_name=tmtx_config.get('run_name', 'tmp'), **tmtx_config.get('fly_kwargs', {}))
 
-        # If a run output dir exists, move the freshly created seed eqdsks into a
-        # same-named subfolder, so they live alongside the run outputs. The reproduction
-        # config (written once by fly()) regenerates seeds from trajectories on replay, so
-        # it embeds no file paths and needs no rewrite here. When there is no output dir the
-        # seeds are left where they were staged: removed by the finally cleanup below for temp
+        # If a run output dir exists, move the seed diagnostic figures into a same-named
+        # subfolder, so they live alongside the run outputs. When there is no output dir they
+        # are left where they were staged: removed by the finally cleanup below for temp
         # staging, or left in the cwd seed_eqdsks_{run_name}/ folder for debug staging.
         out_dir = getattr(tmtx, '_out_dir', None)
         if seed_dir is not None and os.path.isdir(seed_dir) and out_dir:
@@ -9213,13 +9340,11 @@ def run_tmtx_from_config(tmtx_config=None, torax_config=None, config_file=None, 
                 if os.path.exists(dest):
                     shutil.rmtree(dest)
                 shutil.move(seed_dir, dest)
-                tmtx._init_files = [os.path.join(dest, os.path.basename(p))
-                                    for p in tmtx_config['g_eqdsk_arr']]
     finally:
         os.chdir(_prev_cwd)
-        # Remove the temp seed-staging folder. If seeds were moved into the output dir
-        # above, this just deletes the now-empty temp parent; otherwise it cleans up the
-        # seeds that are no longer needed (mirrors the temp EQDSK cleanup in fly()).
+        # Remove the temp seed-staging folder. If the figures were moved into the output dir
+        # above, this just deletes the now-empty temp parent; otherwise it cleans up figures
+        # that are no longer needed.
         if seed_tmp_parent is not None and os.path.isdir(seed_tmp_parent):
             try:
                 shutil.rmtree(seed_tmp_parent)
@@ -9292,15 +9417,30 @@ def _init_TM_object(tmtx_config):
     vsc = tm_inputs.get('vsc', None)
     if vsc is not None:
         mygs.set_coil_vsc({f"{vsc}U": 1.0, f"{vsc}L": -1.0})
-    # tm_inputs['coil_bounds'] is [min, max]; default unit is total A-turns (public unit),
-    # converted to the per-winding current [A/turn] TokaMaker expects (I[A/turn] =
-    # I[A-turns] / n_turns). Set tm_inputs['coil_bounds_units']='A/turn' to instead pass the
-    # per-winding current straight through (applied identically to every coil, no turn scaling).
-    _lo, _hi = tm_inputs['coil_bounds']
+    # tm_inputs['coil_bounds'] is a [min, max] pair applied to every coil, or a
+    # {coil_name: [min, max]} dict for per-coil limits (the same two forms
+    # set_TokaMaker_coil_reg accepts, so the seed and coupled stages agree). The default
+    # unit is total A-turns (public unit), converted to the per-winding current [A/turn]
+    # TokaMaker expects (I[A/turn] = I[A-turns] / n_turns). Set
+    # tm_inputs['coil_bounds_units']='A/turn' to pass the per-winding current straight
+    # through with no turn scaling. Coils absent from a dict are left unbounded.
+    _bounds_in = tm_inputs['coil_bounds']
+    _per_coil = isinstance(_bounds_in, dict)
+    if _per_coil:
+        _unknown = [k for k in _bounds_in if k not in mygs.coil_sets]
+        if _unknown:
+            raise KeyError(f'coil_bounds: unknown coil(s) {_unknown}; '
+                           f'valid coils are {list(mygs.coil_sets)}')
+    else:
+        _lo, _hi = _bounds_in
     _bounds_units = TokaMaker_TORAX._normalize_coil_bounds_units(
         tm_inputs.get('coil_bounds_units', 'A-turns'))
     coil_bounds = {}
     for key in mygs.coil_sets:
+        if _per_coil:
+            if key not in _bounds_in:
+                continue
+            _lo, _hi = _bounds_in[key]
         nt = mygs.coil_sets[key].get('net_turns', 1.0) or 1.0
         if _bounds_units == 'A/turn':
             coil_bounds[key] = [_lo, _hi]                # already per-winding current
@@ -9319,10 +9459,19 @@ def _init_TM_object(tmtx_config):
             reg_terms.append(mygs.coil_reg_term({name: 1.0}, target=0.0, weight=w))
         elif name.startswith(("PF", "VS")):
             reg_terms.append(mygs.coil_reg_term({name: 1.0}, target=0.0, weight=1.0e-2))
-    for upper in mygs.coil_sets:
-        lower = f"{upper[:-1]}L"
-        if upper.endswith("U") and lower in mygs.coil_sets:
-            reg_terms.append(mygs.coil_reg_term({upper: 1.0, lower: -1.0}, target=0.0, weight=1.0e2))
+    # Up-down symmetry (I_upper - I_lower = 0), gated on the same tm_inputs['coil_updownsym']
+    # the coupled solves use. This MUST be off for a single-null pulse: symmetric coil
+    # currents cannot hold an asymmetric X-point, and the symmetry term outweighs the
+    # per-coil terms here 1e4:1, so the seed otherwise comes out as an up-down symmetric
+    # plasma no matter what shape was asked for. The weight stays local to this stage --
+    # the per-coil weights here (1e-2) are not the set_TokaMaker_coil_reg ones (1e-1), so
+    # coil_symmetry_weight does not carry over.
+    if tm_inputs.get('coil_updownsym', True):
+        for upper in mygs.coil_sets:
+            lower = f"{upper[:-1]}L"
+            if upper.endswith("U") and lower in mygs.coil_sets:
+                reg_terms.append(mygs.coil_reg_term({upper: 1.0, lower: -1.0}, target=0.0,
+                                                    weight=1.0e2))
     reg_terms.append(mygs.coil_reg_term({"#VSC": 1.0}, target=0.0, weight=1.0e2))
     mygs.set_coil_reg(reg_terms=reg_terms)
 
@@ -9345,16 +9494,18 @@ def _output_mode_is_debug(output_mode):
     return False
 
 
-def _create_seed_eqdsks(tmtx_config, mygs, save_dir=None):
-    r'''! Create the seed gEQDSK files that seed the TokaMaker_TORAX coupling.
+def _create_seed_equilibria(tmtx_config, mygs, save_dir=None):
+    r'''! Solve the seed equilibria that seed the TokaMaker_TORAX coupling.
 
         Uses the time-dependent trajectory paradigm: seed_eqdsk_config holds {time: value}
         trajectory dicts for the shape/flux quantities. At each requested seed time the
-        trajectories are interpolated and a TokaMaker GS solve produces one gEQDSK.
+        trajectories are interpolated and a TokaMaker GS solve produces one seed record
+        (@ref seed_from_equilibrium) -- no gEQDSK is written, so nothing is resampled onto a
+        rectangular grid and re-contoured on the way in.
 
         seed_eqdsk_config keys
         ----------------------
-          create_seed_eqdsks : bool       create files (True) or load existing (handled by caller).
+          create_seed_eqdsks : bool       solve seeds (True) or load existing (handled by caller).
           eq_times           : list[float] seed solve times (s). If None/empty, evenly spaced
                                            num_seed_eqdsks points across [t_sim_start, t_sim_end].
           num_seed_eqdsks    : int         used only when eq_times is None/empty.
@@ -9369,16 +9520,16 @@ def _create_seed_eqdsks(tmtx_config, mygs, save_dir=None):
           x_points           : (n,2) array X-point [R,Z] targets used in the diverted window.
           diverted_lcfs      : (n,2) array LCFS isoflux points used in the diverted window.
           n_isoflux          : int         isoflux points for the limited (analytic) LCFS (default 28).
-          eqdsk_nr, eqdsk_nz : int         gEQDSK grid resolution (default 900).
+          n_surfaces         : int         flux surfaces per seed handed to TORAX (default N_SURFACES).
 
         @param tmtx_config TMTX config dict.
         @param mygs Configured TokaMaker object (from _init_TM_object).
-        @param save_dir Directory for the seed files. None -> a seed_eqdsks_{run_name}/
-                        subfolder. In debug mode this subfolder is created in the cwd (so the
-                        seeds are visible during the run); otherwise it is placed inside a
-                        fresh temp dir. Either way the caller moves it into the run output dir
-                        (or cleans up the temp parent) after the run.
-        @return List of absolute gEQDSK file paths, ordered by eq_times.
+        @param save_dir Directory for the per-seed diagnostic figures. None -> a
+                        seed_eqdsks_{run_name}/ subfolder. In debug mode this subfolder is
+                        created in the cwd (so the figures are visible during the run);
+                        otherwise it is placed inside a fresh temp dir. Either way the caller
+                        moves it into the run output dir (or cleans up the temp parent).
+        @return (seeds, save_dir): seed records ordered by eq_times, and the figure directory.
     '''
     sc = tmtx_config['seed_eqdsk_config']
     run_name = tmtx_config.get('run_name', 'tmp')
@@ -9406,8 +9557,8 @@ def _create_seed_eqdsks(tmtx_config, mygs, save_dir=None):
     x_points        = sc.get('x_points', None)
     diverted_lcfs   = sc.get('diverted_lcfs', None)
     n_isoflux       = sc.get('n_isoflux', 28)
-    eqdsk_nr        = sc.get('eqdsk_nr', 900)
-    eqdsk_nz        = sc.get('eqdsk_nz', 900)
+    n_surfaces      = sc.get('n_surfaces', tmtx_config.get('n_surfaces', N_SURFACES))
+    last_surface_factor = tmtx_config.get('last_surface_factor', 0.999)
 
     if save_dir is None:
         # The seed_eqdsks_{run_name} subfolder name is preserved so run_tmtx_from_config can
@@ -9426,7 +9577,7 @@ def _create_seed_eqdsks(tmtx_config, mygs, save_dir=None):
     def _is_diverted(t):
         return diverted_window is not None and diverted_window[0] <= t <= diverted_window[1]
 
-    eqdsk_paths = []
+    seeds = []
     for idx, t in enumerate(eq_times):
         a     = _interp_traj(a_traj, t)
         kappa = _interp_traj(kappa_traj, t)
@@ -9465,6 +9616,11 @@ def _create_seed_eqdsks(tmtx_config, mygs, save_dir=None):
                 cb = mygs.plot_machine(fig, ax, coil_colormap='seismic', coil_symmap=False,
                                        coil_scale=1.E-6, coil_clabel=r'$I_C$ [MA-turns]')
                 cbnd = tmtx_config.get('tm_inputs', {}).get('coil_bounds')
+                if isinstance(cbnd, dict):
+                    # Per-coil bounds: one colour scale has to cover every coil, so span
+                    # the widest limit in the dict.
+                    cbnd = ([min(v[0] for v in cbnd.values()), max(v[1] for v in cbnd.values())]
+                            if cbnd else None)
                 if cb is not None and cbnd is not None:
                     cb.mappable.set_clim(cbnd[0] * 1.E-6, cbnd[1] * 1.E-6)
                 mygs.plot_constraints(fig, ax)
@@ -9494,18 +9650,14 @@ def _create_seed_eqdsks(tmtx_config, mygs, save_dir=None):
                 f"(Ip={Ip/1e6:.2f} MA): {err}"
             )
 
-        # Successful solve: print stats, save the eqdsk and the diagnostic figure.
+        # Successful solve: print stats, capture the seed and save the diagnostic figure.
         mygs.print_info()
-
-        out = os.path.join(save_dir, f"seed_{idx:03d}_{name}.eqdsk")
-        mygs.save_eqdsk(out, cocos=2, nr=eqdsk_nr, nz=eqdsk_nz)
-        eqdsk_paths.append(os.path.abspath(out))
-
+        seeds.append(seed_from_equilibrium(mygs, n_surfaces, last_surface_factor))
         _save_seed_fig(ok=True)
 
     # Persist the resolved seed times back so reproduction / downstream see the same grid.
     sc['eq_times'] = eq_times
-    return eqdsk_paths
+    return seeds, save_dir
 
 
 #: tm_inputs coil-regularization keys -> set_TokaMaker_coil_reg() kwargs.
@@ -9585,7 +9737,7 @@ def _init_TMTX_from_configs(tmtx_config, torax_config, mygs):
     r'''! Build a TokaMaker_TORAX object from the TMTX and TORAX config dicts.
 
             tmtx_config carries everything that is TokaMaker-specific or shared between the
-            two codes (Ip, time window, tm_times, seed eqdsk paths, pedestal,
+            two codes (Ip, time window, tm_times, seed equilibria, pedestal,
             diverted_shape_targets, evolve flags). All coil settings — the single global
             hard bounds, regularization weights, and rate limits — live in tm_inputs under
             coil_* keys and are applied by _apply_coil_config(). torax_config is the raw
@@ -9593,7 +9745,8 @@ def _init_TMTX_from_configs(tmtx_config, torax_config, mygs):
             grid from its geometry.n_rho / geometry.face_centers).
 
             Required tmtx_config keys: 'R0', 'B0', 'Ip', 't_sim_start', 't_sim_end',
-            'tx_dt', and seed eqdsk paths in 'g_eqdsk_arr' with matching seed times in
+            'tx_dt', and seed equilibria in 'g_eqdsk_arr' (gEQDSK paths, or the seed records
+            _create_seed_equilibria returns) with matching seed times in
             seed_eqdsk_config['eq_times'].
 
             @param tmtx_config Dictionary (TMTX config format).
@@ -9603,18 +9756,18 @@ def _init_TMTX_from_configs(tmtx_config, torax_config, mygs):
     '''
     sc = tmtx_config.get('seed_eqdsk_config', {})
 
-    g_eqdsk_arr = tmtx_config.get('g_eqdsk_arr')
-    if not g_eqdsk_arr:
-        raise ValueError("tmtx_config['g_eqdsk_arr'] must list the seed gEQDSK files.")
+    seeds = tmtx_config.get('g_eqdsk_arr')
+    if not seeds:
+        raise ValueError("tmtx_config['g_eqdsk_arr'] must list the seed equilibria.")
 
     eq_times = sc.get('eq_times')
     if not eq_times:
         eq_times = np.linspace(tmtx_config['t_sim_start'], tmtx_config['t_sim_end'],
-                               len(g_eqdsk_arr)).tolist()
+                               len(seeds)).tolist()
     eq_times = [float(t) for t in eq_times]
-    if len(eq_times) != len(g_eqdsk_arr):
+    if len(eq_times) != len(seeds):
         raise ValueError('Length of seed eq_times and g_eqdsk_arr must match '
-                         f'({len(eq_times)} vs {len(g_eqdsk_arr)}).')
+                         f'({len(eq_times)} vs {len(seeds)}).')
 
     tm_times = tmtx_config.get('tm_times')
     if not tm_times:
@@ -9626,12 +9779,13 @@ def _init_TMTX_from_configs(tmtx_config, torax_config, mygs):
         t_init=tmtx_config['t_sim_start'],
         t_final=tmtx_config['t_sim_end'],
         eqtimes=np.array(eq_times, dtype=float),
-        g_eqdsk_arr=list(g_eqdsk_arr),
+        seeds=list(seeds),
         tokamaker_obj=mygs,
         tx_dt=tmtx_config['tx_dt'],
         tm_times=tm_times,
         last_surface_factor=tmtx_config.get('last_surface_factor', 0.999),
         truncate_eq=tmtx_config.get('truncate_eq', False),
+        n_surfaces=tmtx_config.get('n_surfaces', N_SURFACES),
     )
 
     if tmtx_config.get('Ip') is None:
