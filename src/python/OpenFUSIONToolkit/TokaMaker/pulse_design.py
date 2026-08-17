@@ -57,7 +57,7 @@ mu_0 = 4.0 * np.pi * 1e-7
 N_SURFACES = 200
 #: Grid resolution for the gEQDSK files fly(save_eqdsks=True) writes. Diagnostic output
 #: only -- the coupling itself never reads a gEQDSK back.
-EQDSK_SAVE_NR_NZ = 900
+EQDSK_SAVE_NR_NZ = 200
 
 # Default TORAX radial face count for loop 0 coarse runs (evenly spaced normalized rho).
 DEFAULT_LOOP0_TX_FACE_POINTS = 51
