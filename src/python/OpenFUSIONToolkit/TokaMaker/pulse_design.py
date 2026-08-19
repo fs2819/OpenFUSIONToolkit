@@ -105,17 +105,18 @@ BASE_CONFIG = {
     # TokaMaker side, since a different core transport gives a different core current
     # profile for the GS solve to chase.
     #
-    # The 'combined' wrapper is likewise required, not stylistic. TORAX removed
+    # The component-model layout is likewise required, not stylistic. TORAX removed
     # apply_inner_patch / apply_outer_patch and the *_inner / *_outer coefficients; a
     # patch is now a component model restricted with rho_min / rho_max and merged with
     # 'overwrite'. Clipping and smoothing moved to the combined model too, where they act
     # on the aggregated output of every component -- which is what the old
     # smooth_everywhere=True asked for, so it has no separate setting any more.
+    # As of TORAX 1.4.3 the components live in the 'core_transport_models' dict
+    # (name -> model) on 'transport' itself; there is no 'combined' model_name.
     #
     # The patch values are the defaults the removed apply_inner_patch used.
     # apply_outer_patch was False, so no outer component is built here.
     'transport': {
-        'model_name': 'combined',
         'chi_min': 0.05,
         'chi_max': 100,
         'D_e_min': 0.05,
@@ -123,8 +124,8 @@ BASE_CONFIG = {
         'V_e_min': -10,
         'V_e_max': 10,
         'smoothing_width': 0.3,
-        'transport_models': [
-            {
+        'core_transport_models': {
+            'qlknn': {
                 'model_name': 'qlknn',
                 'DV_effective': True,
                 'include_ITG': True,
@@ -132,7 +133,7 @@ BASE_CONFIG = {
                 'include_ETG': True,
                 'avoid_big_negative_s': False,
             },
-            {
+            'inner_patch': {
                 'model_name': 'constant',
                 'rho_max': 0.1,
                 'merge_mode': 'overwrite',
@@ -141,7 +142,7 @@ BASE_CONFIG = {
                 'D_e': 0.2,
                 'V_e': 0.0,
             },
-        ],
+        },
     },
     'solver': {
         'solver_type': 'newton_raphson',
@@ -292,7 +293,7 @@ def seed_from_equilibrium(equil, n_surfaces=N_SURFACES, last_surface_factor=0.99
         'pprime': Pp,
         'qpsi': np.interp(psi_norm, fsa['psi_norm'], fsa['q']),
         'pres': P,
-        'geometry': {'equilibrium': fsa},
+        'geometry': {'fsa_profiles': fsa},
     }
 
 
@@ -2446,7 +2447,7 @@ class TokaMaker_TORAX:
                 i_last = len(self._tm_times) - 1
                 fsa_last = self._equil_fsa.get((prev_lp, i_last))
                 if fsa_last is not None:
-                    entries = {t: {'equilibrium': fsa_last} for t in self._tm_times}
+                    entries = {t: {'fsa_profiles': fsa_last} for t in self._tm_times}
                     n_tm = len(self._tm_times)
                     self._log(
                         f'Loop {self._current_loop}: steady_state_mode geometry — all TX times use '
@@ -2465,7 +2466,7 @@ class TokaMaker_TORAX:
                 for i, t in enumerate(self._tm_times):
                     fsa = self._equil_fsa.get((prev_lp, i))
                     if fsa is not None:
-                        entries[t] = {'equilibrium': fsa}
+                        entries[t] = {'fsa_profiles': fsa}
                     else:
                         self._log(f'Loop {self._current_loop}: TM failed at t={t:.2f}s; '
                                   f'skipping timepoint in TORAX geometry (TORAX will interpolate).')
@@ -2483,7 +2484,7 @@ class TokaMaker_TORAX:
             if (self._psi_init is not None and not self._relax
                     and not self._steady_state_mode):
                 seed_geo = self._seeds[0]['geometry']
-                if 'equilibrium' not in seed_geo:
+                if 'fsa_profiles' not in seed_geo:
                     self._log(
                         f'Loop {self._current_loop}: seed at t_init not applied — a gEQDSK seed '
                         'cannot share a config with the TM flux surface averages.'
@@ -2586,7 +2587,7 @@ class TokaMaker_TORAX:
     def _tx_geometry(self, entries, *, Ip_from_parameters=True):
         r'''! Build the TORAX geometry block for a {time: geometry entry} map.
 
-                An entry is either {'equilibrium': get_fsa() dict} -- what every TokaMaker solve
+                An entry is either {'fsa_profiles': get_fsa() dict} -- what every TokaMaker solve
                 produces, and what a seed solved by @ref _create_seed_equilibria produces -- or
                 {'geometry_file': ..., 'cocos': ...} for a gEQDSK seed supplied from outside.
                 TORAX applies one geometry type to all of its time slices, so a config is either
@@ -2598,7 +2599,7 @@ class TokaMaker_TORAX:
                        from the geometry, so a bad equilibrium cannot move the Ip target.
                 @return Geometry sub-dict for a TORAX config.
         '''
-        is_fsa = [('equilibrium' in e) for e in entries.values()]
+        is_fsa = [('fsa_profiles' in e) for e in entries.values()]
         if all(is_fsa):
             geometry = {'geometry_type': 'tokamaker'}
         elif not any(is_fsa):
@@ -3190,7 +3191,7 @@ class TokaMaker_TORAX:
             prev_lp = self._current_loop - 1
             i_eq = (len(self._tm_times) - 1) if self._steady_state_mode else 0
             fsa = self._equil_fsa.get((prev_lp, i_eq))
-            relax_geo = {'equilibrium': fsa} if fsa is not None else self._seeds[0]['geometry']
+            relax_geo = {'fsa_profiles': fsa} if fsa is not None else self._seeds[0]['geometry']
             if fsa is None:
                 if not self._test_tx_geometry(relax_geo):
                     raise ValueError(
@@ -3689,17 +3690,6 @@ class TokaMaker_TORAX:
                 solve_succeeded = False
                 level_attempts = []
 
-                # set increasing tolerance requirements for TM solves
-                # if self._current_loop <=1:
-                #     self._tm.settings.nl_tol = 1e-6
-                #     self._tm.update_settings()
-                # elif self._current_loop == 2:
-                #     self._tm.settings.nl_tol = 1e-6
-                # #     self._tm.update_settings()
-                # elif self._current_loop >= 3:
-                #     self._tm.settings.nl_tol = 1e-6
-                #     self._tm.update_settings()
-
                 ffp_prof_raw    = copy.deepcopy(ffp_prof)
                 pp_prof_raw     = copy.deepcopy(pp_prof)
                 ffp_ni_prof_raw = copy.deepcopy(self._state['ffp_ni_prof'][i])
@@ -3858,7 +3848,7 @@ class TokaMaker_TORAX:
                     except Exception as _fsa_exc:
                         step_fail_msg = f'get_fsa failed at t index {i}: {_fsa_exc}'
                     else:
-                        if self._test_tx_geometry({'equilibrium': fsa}):
+                        if self._test_tx_geometry({'fsa_profiles': fsa}):
                             self._equil_fsa[(self._current_loop, i)] = fsa
                             self._tm_stats[(self._current_loop, i)] = \
                                 _tm_solve_stats(self._state['equil'][i], fsa)

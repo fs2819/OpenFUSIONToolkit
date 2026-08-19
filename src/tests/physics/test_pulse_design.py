@@ -3,6 +3,9 @@ r'''! Minimal ITER test for pulse_design.py: the TokaMaker_TORAX coupled pulse d
 Builds two flattop-like seed equilibria (same Ip),
 runs a 5 s simulation at constant Ip, and returns a flat dict of scalars.
 
+Seeds are handed to TORAX as get_fsa() flux surface averages, so the run exercises
+the 'tokamaker' geometry rather than re-contoured gEQDSKs.
+
 Expects ITER_mesh.h5 produced from src/examples/TokaMaker/ITER/ITER_mesh_ex.ipynb,
 or set environment variable TOKAMAKER_ITER_MESH to the .h5 path.
 
@@ -160,8 +163,8 @@ def _run_tokamaker_torax(
     Ip_flattop: float = 15.0e6,
     pax_a: float = 6.2e5,
     pax_b: float = 5.7e5,
-    eqdsk_nr: int = 100,
-    eqdsk_nz: int = 100,
+    n_surfaces: int = 200,
+    last_surface_factor: float = 0.99,
     max_loop: int = 1,
     loop0: bool = True,
 ) -> Dict[str, Any]:
@@ -177,6 +180,9 @@ def _run_tokamaker_torax(
         pax_a, pax_b
             Axis pressure targets [Pa] for the two seeds (slight mismatch so transport
             has something to do while Ip stays flat).
+        n_surfaces, last_surface_factor
+            Flux surface sampling handed to get_fsa(). Shared by the seeds and the
+            TokaMaker_TORAX object so both sample the same surfaces.
         max_loop
             Highest counted coupling index (see TokaMaker_TORAX.fly); default 1.
         loop0
@@ -191,8 +197,12 @@ def _run_tokamaker_torax(
     from OpenFUSIONToolkit import OFT_env
     from OpenFUSIONToolkit.TokaMaker import TokaMaker
     from OpenFUSIONToolkit.TokaMaker.meshing import load_gs_mesh
-    from OpenFUSIONToolkit.TokaMaker.pulse_design import TokaMaker_TORAX, summary
-    from OpenFUSIONToolkit.TokaMaker.util import create_power_flux_fun, read_eqdsk
+    from OpenFUSIONToolkit.TokaMaker.pulse_design import (
+        TokaMaker_TORAX,
+        seed_from_equilibrium,
+        summary,
+    )
+    from OpenFUSIONToolkit.TokaMaker.util import create_power_flux_fun
 
     mesh = os.path.abspath(mesh_path or _default_iter_mesh_path())
     if not os.path.isfile(mesh):
@@ -209,8 +219,6 @@ def _run_tokamaker_torax(
     diverted_pts = np.vstack((isoflux_pts, x_point))
 
     work_dir = tempfile.mkdtemp(prefix="test_tmtx_")
-    eq_a = os.path.join(work_dir, "seed_t0.eqdsk")
-    eq_b = os.path.join(work_dir, "seed_t5.eqdsk")
 
     myoft = OFT_env(nthreads=nthreads)
     mygs = TokaMaker(myoft)
@@ -230,18 +238,25 @@ def _run_tokamaker_torax(
     mygs.set_profiles(ffp_prof=ffp_prof, pp_prof=pp_prof)
 
     seed_metrics: Dict[str, float] = {}
+    # Seeds are kept as get_fsa() flux surface averages rather than written out as
+    # gEQDSKs, so TORAX takes the 'tokamaker' geometry and nothing round trips through
+    # a rectangular grid. seeds=[...] of gEQDSK filenames selects the 'eqdsk' geometry
+    # instead; the two cannot be mixed in one config.
+    seeds = []
 
-    for idx, (pax, eq_path) in enumerate(((pax_a, eq_a), (pax_b, eq_b))):
+    for idx, pax in enumerate((pax_a, pax_b)):
         mygs.set_isoflux_constraints(diverted_pts)
         mygs.set_saddle_constraints(x_point)
         mygs.set_targets(Ip=Ip_flattop, pax=pax)
         _build_min_norm_coil_reg(mygs)
         mygs.init_psi()
         mygs.solve()
+        seed = seed_from_equilibrium(
+            mygs, n_surfaces=n_surfaces, last_surface_factor=last_surface_factor
+        )
+        seeds.append(seed)
         seed_metrics[f"seed{idx}_pax_Pa"] = float(pax)
-        mygs.save_eqdsk(eq_path, cocos=2, nr=eqdsk_nr, nz=eqdsk_nz)
-        g = read_eqdsk(eq_path)
-        seed_metrics[f"seed{idx}_psi_lcfs_Wb_per_rad"] = float(-g["psibry"])
+        seed_metrics[f"seed{idx}_psi_lcfs_Wb_per_rad"] = float(seed["psi_lcfs"])
 
     prev_cwd = os.getcwd()
     os.chdir(work_dir)
@@ -251,11 +266,12 @@ def _run_tokamaker_torax(
             t_init=0.0,
             t_final=t_final,
             eqtimes=[0.0, t_final],
-            seeds=["seed_t0.eqdsk", "seed_t5.eqdsk"],
+            seeds=seeds,
             tokamaker_obj=mygs,
             tx_dt=tx_dt,
             tm_times=tm_times,
-            last_surface_factor=0.99,
+            last_surface_factor=last_surface_factor,
+            n_surfaces=n_surfaces,
             truncate_eq=False,
         )
 
@@ -314,6 +330,11 @@ def _run_tokamaker_torax(
     times = np.asarray(tt._tm_times)
     out: Dict[str, Any] = {}
     out.update(seed_metrics)
+    # Resolved through the same helper fly() uses, so this asserts on the geometry
+    # type TORAX was actually handed, not on how the seeds were built.
+    out["torax_geometry_type"] = str(
+        tt._tx_geometry({0.0: seeds[0]["geometry"]})["geometry_type"]
+    )
     out["Ip_flattop_MA"] = float(Ip_flattop / 1.0e6)
     out["t_final_s"] = float(t_final)
     out["tx_dt_s"] = float(tx_dt)
@@ -356,6 +377,9 @@ def test_tokamaker_torax() -> None:
     assert isinstance(result, dict)
     assert "Ip_flattop_MA" in result
     assert "t_final_s" in result
+    # Guards the FSA geometry path: seeds built by seed_from_equilibrium must reach
+    # TORAX as the 'tokamaker' geometry, not as re-contoured gEQDSKs.
+    assert result["torax_geometry_type"] == "tokamaker"
 
 
 def main() -> None:
