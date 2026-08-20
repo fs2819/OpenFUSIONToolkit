@@ -243,7 +243,7 @@ class MyEncoder(json.JSONEncoder):
             return obj.to_numpy().tolist()
         return json.JSONEncoder.default(self, obj)
 
-def fsa_psi_norm(n_surfaces=N_SURFACES, last_surface_factor=0.99, psi_min=1.0e-4):
+def fsa_psi_norm(n_surfaces=N_SURFACES, last_surface_factor=0.9999, psi_min=1.0e-4):
     r'''! Flux surface sampling locations, uniform in \f$\sqrt{\hat{\psi}}\f$.
 
         \f$\hat{\rho} \sim \sqrt{\hat{\psi}}\f$ near the axis, so sampling uniformly in
@@ -257,7 +257,7 @@ def fsa_psi_norm(n_surfaces=N_SURFACES, last_surface_factor=0.99, psi_min=1.0e-4
     return np.linspace(np.sqrt(psi_min), np.sqrt(last_surface_factor), n_surfaces) ** 2
 
 
-def seed_from_equilibrium(equil, n_surfaces=N_SURFACES, last_surface_factor=0.99):
+def seed_from_equilibrium(equil, n_surfaces=N_SURFACES, last_surface_factor=0.9999):
     r'''! Seed record read straight off a solved TokaMaker equilibrium.
 
         This is everything TokaMaker_TORAX takes from a seed: the shape and profile targets
@@ -338,7 +338,7 @@ class TokaMaker_TORAX:
 
     # ─── Initialization ─────────────────────────────────────────────────────────
 
-    def __init__(self, t_init, t_final, eqtimes, seeds, tokamaker_obj, tx_dt=0.1, tm_times=None, last_surface_factor=0.99, truncate_eq=False,
+    def __init__(self, t_init, t_final, eqtimes, seeds, tokamaker_obj, tx_dt=0.1, tm_times=None, last_surface_factor=0.9999, truncate_eq=False,
                  n_surfaces=N_SURFACES):
         r'''! Initialize the Coupled TokaMaker + TORAX object.
                 @param t_init Start time (s).
@@ -9548,7 +9548,7 @@ def _create_seed_equilibria(tmtx_config, mygs, save_dir=None):
     diverted_lcfs   = sc.get('diverted_lcfs', None)
     n_isoflux       = sc.get('n_isoflux', 28)
     n_surfaces      = sc.get('n_surfaces', tmtx_config.get('n_surfaces', N_SURFACES))
-    last_surface_factor = tmtx_config.get('last_surface_factor', 0.999)
+    last_surface_factor = tmtx_config.get('last_surface_factor', 0.9999)
 
     if save_dir is None:
         # The seed_eqdsks_{run_name} subfolder name is preserved so run_tmtx_from_config can
@@ -9773,7 +9773,7 @@ def _init_TMTX_from_configs(tmtx_config, torax_config, mygs):
         tokamaker_obj=mygs,
         tx_dt=tmtx_config['tx_dt'],
         tm_times=tm_times,
-        last_surface_factor=tmtx_config.get('last_surface_factor', 0.999),
+        last_surface_factor=tmtx_config.get('last_surface_factor', 0.9999),
         truncate_eq=tmtx_config.get('truncate_eq', False),
         n_surfaces=tmtx_config.get('n_surfaces', N_SURFACES),
     )
