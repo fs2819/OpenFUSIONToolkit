@@ -458,7 +458,7 @@ class TokaMaker_TORAX:
         self._state['coupling_cost'] = np.full(N, np.nan)
 
         # ── Safety factor profiles {i: {'x':..., 'y':..., 'type':...}} ─────────
-        self._state['q_prof_eqdsk'] = {}
+        self._state['q_prof_equil'] = {}
         self._state['q_prof_tm']    = {}
         self._state['q_prof_tx']    = {}
 
@@ -472,9 +472,9 @@ class TokaMaker_TORAX:
         self._state['pp_prof']        = {}  # p' profile sent to GS solve (updated each loop)
         self._state['ffp_ni_prof']    = {}  # FF' from non-inductive current only
         self._state['eta_prof']       = {}  # resistivity profile
-        self._state['ffp_prof_eqdsk'] = {}  # seed FF' from EQDSK (normalized)
-        self._state['pp_prof_eqdsk']  = {}  # seed p' from EQDSK (normalized)
-        self._state['p_prof_eqdsk']   = {}  # seed pressure from EQDSK (normalized)
+        self._state['ffp_prof_equil'] = {}  # seed FF' from EQDSK (normalized)
+        self._state['pp_prof_equil']  = {}  # seed p' from EQDSK (normalized)
+        self._state['p_prof_equil']   = {}  # seed pressure from EQDSK (normalized)
         self._state['ffp_prof_tx']    = {}  # FF' from TORAX
         self._state['pp_prof_tx']     = {}  # p' from TORAX
         self._state['ffp_prof_tm']    = {}  # FF' from TM solve (FF, not FF')
@@ -646,13 +646,13 @@ class TokaMaker_TORAX:
             self._state['pp_prof'][i] = {'x': self._psi_N.copy(), 'y': interp_prof(pp_prof, t), 'type': 'linterp'}
             self._state['ffp_ni_prof'][i] = {'x': [], 'y': [], 'type': 'linterp'}
 
-            self._state['ffp_prof_eqdsk'][i] = self._state['ffp_prof'][i].copy()
-            self._state['pp_prof_eqdsk'][i] = self._state['pp_prof'][i].copy()
-            self._state['p_prof_eqdsk'][i] = {'x': self._psi_N.copy(), 'y': interp_prof(pres_prof, t), 'type': 'linterp'}
-            self._state['pp_prof_eqdsk'][i]['y'] /= self._state['pp_prof_eqdsk'][i]['y'][0]
-            self._state['p_prof_eqdsk'][i]['y'] /= self._state['p_prof_eqdsk'][i]['y'][0]
-            self._state['ffp_prof_eqdsk'][i]['y'] /= self._state['ffp_prof_eqdsk'][i]['y'][0]
-            self._state['q_prof_eqdsk'][i] = {'x': self._psi_N.copy(), 'y': interp_prof(q_prof, t), 'type': 'linterp'}
+            self._state['ffp_prof_equil'][i] = self._state['ffp_prof'][i].copy()
+            self._state['pp_prof_equil'][i] = self._state['pp_prof'][i].copy()
+            self._state['p_prof_equil'][i] = {'x': self._psi_N.copy(), 'y': interp_prof(pres_prof, t), 'type': 'linterp'}
+            self._state['pp_prof_equil'][i]['y'] /= self._state['pp_prof_equil'][i]['y'][0]
+            self._state['p_prof_equil'][i]['y'] /= self._state['p_prof_equil'][i]['y'][0]
+            self._state['ffp_prof_equil'][i]['y'] /= self._state['ffp_prof_equil'][i]['y'][0]
+            self._state['q_prof_equil'][i] = {'x': self._psi_N.copy(), 'y': interp_prof(q_prof, t), 'type': 'linterp'}
 
             self._state['eta_prof'][i]= {
                 'x': self._psi_N.copy(),
@@ -1240,7 +1240,7 @@ class TokaMaker_TORAX:
         r'''! Set coil regularization using the dict-based TokaMaker reg_terms API.
 
                 Coil bounds are the one definition of the hard current limit: the same bounds
-                are used for seed-eqdsk generation, the coupled GS solves, and as the per-coil
+                are used for seed-equilibrium generation, the coupled GS solves, and as the per-coil
                 clip for set_coil_rate_limits(). By default they are given in total Amp-turns
                 (A-turns) — the public TokaMaker_TORAX unit for everything coil-current
                 related. Set coil_bounds_units='A/turn' to instead supply the per-winding
@@ -2433,7 +2433,7 @@ class TokaMaker_TORAX:
             for i, t in enumerate(self._eqtimes):
                 if self._test_tx_geometry(self._seeds[i]['geometry']):
                     entries[t] = self._seeds[i]['geometry']
-                elif self._skip_bad_init_eqdsks:
+                elif self._skip_bad_init_equil:
                     t_skipped.append(t)
                 else:
                     raise ValueError(f'Bad seed equilibrium at t={t}: {self._seeds[i]["geometry"]}'
@@ -3589,7 +3589,7 @@ class TokaMaker_TORAX:
                 lcfs = self._state['lcfs_geo'][i]
 
                 # Optional user-prescribed diverted LCFS shape (set_diverted_shape_targets): inside
-                # the diverted window, override the seed-EQDSK shape targets with the user's
+                # the diverted window, override the seed-equilibrium shape targets with the user's
                 # shape. Weights are unchanged, and the X-point trim / strike points below
                 # still apply on top. Outside the window (or if unset), the seed shape stands.
                 if (self._diverted_lcfs_shape is not None
@@ -4414,10 +4414,10 @@ class TokaMaker_TORAX:
     # =========================================================================
 
     def fly(self, run_name='tmp', convergence_threshold=-1.0, max_loop=3,
-            output_mode=False, skip_bad_init_eqdsks=False, save_eqdsks=False,
+            output_mode=False, skip_bad_init_equil=False, save_eqdsks=False,
             initial_relax=True, relax=False, relax_kinetics=False, relax_duration=1.0, relax_dt=0.1,
             t_ave_toggle='off', t_ave_window=0.5, t_ave_causal=True, t_ave_ignore_start=0.25,
-            loop0=False, steady_state_mode=False):
+            loop0=False, steady_state_mode=False, run_timestamp=None):
         r'''! Run TokaMaker_TORAX coupled pulse design loop.
 
                 @param convergence_threshold Max fractional change in consumed flux between loops for convergence.
@@ -4463,7 +4463,11 @@ class TokaMaker_TORAX:
                        tm_diag_loop{N}_tidx{i}.png (successful solves also get profile_loop{N}_tidx{i}.png).
                        After each loop: tm_summary_loop{N}.png. Python logging (TORAX, JAX, etc.) is
                        redirected to the log file; per-loop wall time is printed.
-                @param skip_bad_init_eqdsks If True, skip seed equilibria TORAX rejects instead of raising.
+                @param skip_bad_init_equil If True, skip seed equilibria TORAX rejects instead of raising.
+                @param run_timestamp Timestamp string for the output directory and log file names.
+                       Default None -> stamped when fly() is called. run_tmtx_from_config() passes
+                       one so it can write the seed equilibrium figures into this run's output
+                       directory before fly() starts.
                 @param save_eqdsks If True, write a gEQDSK per TokaMaker timestep of the final loop into
                        the output directory ({loop:03d}.{i:03d}.eqdsk). Diagnostic output only: the
                        coupling passes flux surface averages between the codes and never reads these
@@ -4527,20 +4531,13 @@ class TokaMaker_TORAX:
         except Exception:
             pass  # older JAX versions may not have this config key
 
-        if output_mode is True:
-            output_mode = 'normal'
-        if isinstance(output_mode, str):
-            output_mode = output_mode.strip().lower()
-            if output_mode in ('false', 'none', 'off', 'no') or output_mode is None:
-                output_mode = False
-        if output_mode not in (None, False, 'minimal', 'normal', 'debug'):
-            raise ValueError("Invalid output_mode. Use None, False, 'minimal', 'normal', or 'debug'.")
+        output_mode = _normalize_output_mode(output_mode)
 
         self._output_mode = output_mode
         self._save_outputs = (self._output_mode is not False)
         self._debug_mode = (self._output_mode == 'debug')
         self._diagnostics = self._debug_mode
-        self._skip_bad_init_eqdsks = skip_bad_init_eqdsks
+        self._skip_bad_init_equil = skip_bad_init_equil
         self._run_name = run_name
         self._relax_duration = float(relax_duration)
         _relax_dt = float(relax_dt)
@@ -4556,7 +4553,9 @@ class TokaMaker_TORAX:
         self._t_ave_causal = t_ave_causal
         self._t_ave_ignore_start = t_ave_ignore_start
 
-        dt_str = datetime.now().strftime('%Y-%m-%d_%H%M%S')
+        # run_timestamp lets run_tmtx_from_config() fix the timestamp up front, so the
+        # output directory it wrote the seed figures into is the one this run uses.
+        dt_str = run_timestamp or datetime.now().strftime('%Y-%m-%d_%H%M%S')
         _sim_start_time = time.time()
 
         self._run_timestamp = None if run_name == 'tmp' else dt_str
@@ -4566,7 +4565,9 @@ class TokaMaker_TORAX:
         if self._output_mode is not False:
             if run_name == 'tmp':
                 self._out_dir = os.path.join('./TokaMaker_TORAX_outputs', 'tmp')
-                if os.path.exists(self._out_dir):
+                # Cleared once per run. When run_timestamp was passed the caller already
+                # cleared it and staged the seed figures there, so leave it alone.
+                if os.path.exists(self._out_dir) and run_timestamp is None:
                     shutil.rmtree(self._out_dir)
             else:
                 self._out_dir = os.path.join('./TokaMaker_TORAX_outputs', self._output_file_tag)
@@ -5113,12 +5114,13 @@ class TokaMaker_TORAX:
                 - tmtx_dict is rebuilt from the TokaMaker_TORAX object's state (self._*):
                   Ip, time window, tx_dt, tm_times, pedestal, x_points, evolve, etc. If the
                   object was built by run_tmtx_from_config() the original tmtx_config was
-                  stashed (self._tmtx_config) and is used as the base (so seed-eqdsk
+                  stashed (self._tmtx_config) and is used as the base (so seed-equilibrium
                   trajectories and TM mesh inputs survive); the rebuilt values are layered
-                  on top. Seeds replay exactly as the original run made them: if this run
-                  CREATED its seeds (create_seed_eqdsks=True), the flag stays True and no
-                  file paths are embedded, so replay regenerates them from the trajectories.
-                  If the seeds were PASSED in (loaded), create_seed_eqdsks stays False and
+                  on top. Seeds replay exactly as the original run made them, decided by
+                  whether the seed records carry the gEQDSK path they were read from: if
+                  this run SOLVED its seeds, create_seed_equil is emitted True and no file
+                  paths are embedded, so replay regenerates them from the trajectories. If
+                  the seeds were PASSED in (loaded), create_seed_equil is emitted False and
                   the absolute seed file paths used this run are embedded for reuse.
 
                 @param save_path Explicit output path. Default: tmtx_config_{run}_{ts}.py
@@ -5172,7 +5174,7 @@ class TokaMaker_TORAX:
         }
 
         # Diverted window: X-points, strike points, trim, and optional LCFS shape override
-        # (shape_target=None => seed-EQDSK shape everywhere). Mirrors set_diverted_shape_targets.
+        # (shape_target=None => seed-equilibrium shape everywhere). Mirrors set_diverted_shape_targets.
         tmtx_dict['diverted_shape_targets'] = {
             'diverted_times': (None if self._diverted_times is None
                                else tuple(float(t) for t in self._diverted_times)),
@@ -5214,24 +5216,32 @@ class TokaMaker_TORAX:
         }
 
         # Seeds: a faithful replay should redo exactly what the original run did.
-        #   - If this run CREATED its seeds (original create_seed_eqdsks=True), keep that
-        #     flag True so replay re-solves them from the trajectory inputs (preserved in
-        #     the stashed seed_eqdsk_config). Do NOT embed g_eqdsk_arr file paths.
+        #   - If this run CREATED its seeds, keep create_seed_equil=True so replay re-solves
+        #     them from the trajectory inputs (preserved in the stashed seed_equil_config).
+        #     Do NOT embed seed_equil_arr file paths.
         #   - If the seeds were originally PASSED in (loaded, not created), keep that:
-        #     create_seed_eqdsks=False and embed the absolute file paths used this run.
-        seed_cfg = tmtx_dict.get('seed_eqdsk_config', {})
+        #     create_seed_equil=False and embed the absolute file paths used this run.
+        # Which of the two happened is read off the seed records rather than the config flag:
+        # only seed_from_eqdsk() stamps 'geometry_file', so its presence is the ground truth.
+        # The flag itself cannot be trusted here — a stashed config may omit it, or spell it
+        # with the old create_seed_eqdsks name, and either would silently pick the wrong
+        # branch and emit a config that fails on replay.
+        seed_cfg = tmtx_dict.get('seed_equil_config', {})
         if not isinstance(seed_cfg, dict):
             seed_cfg = {}
-        seeds_were_created = bool(seed_cfg.get('create_seed_eqdsks', False))
+        seed_paths = [s['geometry']['geometry_file'] for s in self._seeds
+                      if 'geometry_file' in s.get('geometry', {})]
+        seeds_were_created = not seed_paths
+        seed_cfg.pop('create_seed_eqdsks', None)   # drop the pre-rename spelling
+        tmtx_dict.pop('g_eqdsk_arr', None)
         seed_cfg['eq_times'] = [float(t) for t in self._eqtimes]
         if seeds_were_created:
-            seed_cfg['create_seed_eqdsks'] = True
-            tmtx_dict.pop('g_eqdsk_arr', None)  # re-solved on replay, not loaded
+            seed_cfg['create_seed_equil'] = True
+            tmtx_dict.pop('seed_equil_arr', None)  # re-solved on replay, not loaded
         else:
-            seed_cfg['create_seed_eqdsks'] = False
-            tmtx_dict['g_eqdsk_arr'] = [s['geometry']['geometry_file'] for s in self._seeds
-                                        if 'geometry_file' in s['geometry']]
-        tmtx_dict['seed_eqdsk_config'] = seed_cfg
+            seed_cfg['create_seed_equil'] = False
+            tmtx_dict['seed_equil_arr'] = seed_paths
+        tmtx_dict['seed_equil_config'] = seed_cfg
 
         tmtx_dict = self._numpy_to_plain_python_keep_arrays(tmtx_dict)
 
@@ -5836,7 +5846,7 @@ def _prof(state_dict, idx):
 
 
 def _make_temp_dir_viz():
-    r'''! Create temp directory for visualization temporary files: RAM-backed on Linux, OS default elsewhere.'''
+    r'''! Create temp directory for visualization temporary files.'''
     if platform.system() == 'Linux' and os.path.isdir('/dev/shm'):
         return tempfile.mkdtemp(prefix='TokaMaker_TORAX_viz_', dir='/dev/shm')
     return tempfile.mkdtemp(prefix='TokaMaker_TORAX_viz_')
@@ -5876,7 +5886,7 @@ def _seed_tm_profiles_for_failure_profile_plot(tt, i):
     s['pp_prof_tm'][i] = copy.deepcopy(s['pp_prof'][i])
     s['ffp_prof_tm'][i] = copy.deepcopy(s['ffp_prof'][i])
     p_axis = float(s['pax'][i])
-    p_tm = copy.deepcopy(s['p_prof_eqdsk'][i])
+    p_tm = copy.deepcopy(s['p_prof_equil'][i])
     p_tm['y'] = np.asarray(p_tm['y'], dtype=float) * max(p_axis, 1e-300)
     s['p_prof_tm'][i] = p_tm
     psi_a = float(s['psi_axis_tm'][i])
@@ -5886,7 +5896,7 @@ def _seed_tm_profiles_for_failure_profile_plot(tt, i):
         'y': psi_a + (psi_l - psi_a) * tt._psi_N,
         'type': 'linterp',
     }
-    s['q_prof_tm'][i] = copy.deepcopy(s['q_prof_eqdsk'][i])
+    s['q_prof_tm'][i] = copy.deepcopy(s['q_prof_equil'][i])
     return True
 
 
@@ -6587,9 +6597,9 @@ def tm_diagnostic_plot(tt, i, t, level_attempts, solve_succeeded, save_path=None
     beta_pol_tx = float(s['beta_pol'][i])
     beta_n_tx = float(s['beta_N_tx'][i])
 
-    _seed_ffp_prof = s.get('ffp_prof_eqdsk', {}).get(i)
-    _seed_pp_prof = s.get('pp_prof_eqdsk', {}).get(i)
-    _seed_q_prof = s.get('q_prof_eqdsk', {}).get(i)
+    _seed_ffp_prof = s.get('ffp_prof_equil', {}).get(i)
+    _seed_pp_prof = s.get('pp_prof_equil', {}).get(i)
+    _seed_q_prof = s.get('q_prof_equil', {}).get(i)
 
     _seed_ffp_x = _seed_ffp_norm = None
     if _seed_ffp_prof is not None:
@@ -7212,7 +7222,7 @@ def plot_tx_relax_profiles(
     )
     _cmap_hist = plt.get_cmap('tab10')
     _user_color = 'tab:green'
-    _eqdsk_psi_color = 'tab:purple'
+    _equil_psi_color = 'tab:purple'
 
     def _one_panel(ax, var_name, ylabel):
         for _entry in _hist:
@@ -7273,7 +7283,7 @@ def plot_tx_relax_profiles(
                         y_g,
                         lw=1.25,
                         ls='-.',
-                        color=_eqdsk_psi_color,
+                        color=_equil_psi_color,
                         alpha=0.95,
                         label=r'init geometry $\psi$ (seed)',
                     )
@@ -9296,50 +9306,35 @@ def run_tmtx_from_config(tmtx_config=None, torax_config=None, config_file=None, 
         os.makedirs(save_dir, exist_ok=True)
         os.chdir(save_dir)
 
-    seed_tmp_parent = None  # temp parent holding freshly created seeds (cleaned in finally)
     try:
         mygs = _init_TM_object(tmtx_config)
 
-        seed_dir = None
-        seed_cfg = tmtx_config.get('seed_eqdsk_config', {})
-        if seed_cfg.get('create_seed_eqdsks', False):
-            tmtx_config['g_eqdsk_arr'], seed_dir = _create_seed_equilibria(tmtx_config, mygs)
-            # In debug mode the seed figures are staged directly in the cwd (not a temp dir), so
-            # there is no temp parent to remove — the folder is only ever moved into the
-            # output dir below. Otherwise track the mkdtemp() parent for finally cleanup.
-            if not _output_mode_is_debug(tmtx_config.get('fly_kwargs', {}).get('output_mode')):
-                seed_tmp_parent = os.path.dirname(seed_dir)  # the mkdtemp() parent to clean up
-        elif not tmtx_config.get('g_eqdsk_arr'):
+        # Resolve this run's output directory up front and hand fly() the same timestamp, so
+        # the seed equilibrium figures can be written straight into it. When output_mode is
+        # False there is no output directory and no figures are drawn at all.
+        run_name = tmtx_config.get('run_name', 'tmp')
+        fly_kwargs = dict(tmtx_config.get('fly_kwargs', {}))
+        run_timestamp = fly_kwargs.get('run_timestamp') or datetime.now().strftime('%Y-%m-%d_%H%M%S')
+        fly_kwargs['run_timestamp'] = run_timestamp
+        seed_fig_dir = _run_output_dir(run_name, fly_kwargs.get('output_mode', False), run_timestamp)
+        if seed_fig_dir is not None and run_name == 'tmp' and os.path.exists(seed_fig_dir):
+            shutil.rmtree(seed_fig_dir)  # tmp/ is cleared once per run; fly() then leaves it
+
+        seed_cfg = tmtx_config.get('seed_equil_config', {})
+        if seed_cfg.get('create_seed_equil', False):
+            tmtx_config['seed_equil_arr'] = _create_seed_equilibria(tmtx_config, mygs,
+                                                                    save_dir=seed_fig_dir)
+        elif not tmtx_config.get('seed_equil_arr'):
             raise ValueError(
-                "seed_eqdsk_config['create_seed_eqdsks'] is False but no 'g_eqdsk_arr' "
+                "seed_equil_config['create_seed_equil'] is False but no 'seed_equil_arr' "
                 "paths were given to load from."
             )
 
         tmtx = _init_TMTX_from_configs(tmtx_config, torax_config, mygs)
 
-        tmtx.fly(run_name=tmtx_config.get('run_name', 'tmp'), **tmtx_config.get('fly_kwargs', {}))
-
-        # If a run output dir exists, move the seed diagnostic figures into a same-named
-        # subfolder, so they live alongside the run outputs. When there is no output dir they
-        # are left where they were staged: removed by the finally cleanup below for temp
-        # staging, or left in the cwd seed_eqdsks_{run_name}/ folder for debug staging.
-        out_dir = getattr(tmtx, '_out_dir', None)
-        if seed_dir is not None and os.path.isdir(seed_dir) and out_dir:
-            dest = os.path.join(out_dir, os.path.basename(seed_dir))
-            if os.path.abspath(dest) != os.path.abspath(seed_dir):
-                if os.path.exists(dest):
-                    shutil.rmtree(dest)
-                shutil.move(seed_dir, dest)
+        tmtx.fly(run_name=run_name, **fly_kwargs)
     finally:
         os.chdir(_prev_cwd)
-        # Remove the temp seed-staging folder. If the figures were moved into the output dir
-        # above, this just deletes the now-empty temp parent; otherwise it cleans up figures
-        # that are no longer needed.
-        if seed_tmp_parent is not None and os.path.isdir(seed_tmp_parent):
-            try:
-                shutil.rmtree(seed_tmp_parent)
-            except OSError:
-                pass
 
     return tmtx
 
@@ -9471,34 +9466,61 @@ def _init_TM_object(tmtx_config):
     return mygs
 
 
-def _output_mode_is_debug(output_mode):
-    r'''! Whether a fly() output_mode value selects debug mode, using the same normalization
-            as TokaMaker_TORAX.fly() (True -> 'normal'; strings stripped/lowercased).
+def _normalize_output_mode(output_mode):
+    r'''! Normalize a raw fly() output_mode value to False / 'minimal' / 'normal' / 'debug'.
+
+            True is an alias for 'normal'; strings are stripped/lowercased; None and the
+            strings 'false'/'none'/'off'/'no' map to False.
+
             @param output_mode Raw output_mode value (as passed to fly()).
-            @return True if this resolves to 'debug'.
+            @return The normalized value.
     '''
     if output_mode is True:
-        return False  # alias for 'normal'
+        return 'normal'
     if isinstance(output_mode, str):
-        return output_mode.strip().lower() == 'debug'
-    return False
+        output_mode = output_mode.strip().lower()
+        if output_mode in ('false', 'none', 'off', 'no'):
+            return False
+    if output_mode is None:
+        return False
+    if output_mode not in (False, 'minimal', 'normal', 'debug'):
+        raise ValueError("Invalid output_mode. Use None, False, 'minimal', 'normal', or 'debug'.")
+    return output_mode
+
+
+def _run_output_dir(run_name, output_mode, run_timestamp):
+    r'''! The output directory a run will use, derived exactly as fly() derives it.
+
+            Lets run_tmtx_from_config() know the output directory before fly() is called,
+            so the seed equilibrium figures can be written straight into it instead of
+            being staged elsewhere and moved afterwards.
+
+            @param run_name Run name ('tmp' gets the fixed tmp/ folder, no timestamp).
+            @param output_mode Raw output_mode value (as passed to fly()).
+            @param run_timestamp Timestamp string shared with fly() via its run_timestamp kwarg.
+            @return Path to the output directory, or None when output_mode is False.
+    '''
+    if _normalize_output_mode(output_mode) is False:
+        return None
+    tag = 'tmp' if run_name == 'tmp' else f'{run_name}_{run_timestamp}'
+    return os.path.join('./TokaMaker_TORAX_outputs', tag)
 
 
 def _create_seed_equilibria(tmtx_config, mygs, save_dir=None):
     r'''! Solve the seed equilibria that seed the TokaMaker_TORAX coupling.
 
-        Uses the time-dependent trajectory paradigm: seed_eqdsk_config holds {time: value}
+        Uses the time-dependent trajectory paradigm: seed_equil_config holds {time: value}
         trajectory dicts for the shape/flux quantities. At each requested seed time the
         trajectories are interpolated and a TokaMaker GS solve produces one seed record
         (@ref seed_from_equilibrium) -- no gEQDSK is written, so nothing is resampled onto a
         rectangular grid and re-contoured on the way in.
 
-        seed_eqdsk_config keys
+        seed_equil_config keys
         ----------------------
-          create_seed_eqdsks : bool       solve seeds (True) or load existing (handled by caller).
+          create_seed_equil  : bool        solve seeds (True) or load existing (handled by caller).
           eq_times           : list[float] seed solve times (s). If None/empty, evenly spaced
-                                           num_seed_eqdsks points across [t_sim_start, t_sim_end].
-          num_seed_eqdsks    : int         used only when eq_times is None/empty.
+                                           num_seed_equil points across [t_sim_start, t_sim_end].
+          num_seed_equil     : int         used only when eq_times is None/empty.
           a, kappa, delta    : {t: value}  plasma minor radius / elongation / triangularity.
           R_mag              : {t: value}  magnetic-axis major radius (optional; if absent,
                                            R0 (geometry) is used as a constant).
@@ -9514,14 +9536,13 @@ def _create_seed_equilibria(tmtx_config, mygs, save_dir=None):
 
         @param tmtx_config TMTX config dict.
         @param mygs Configured TokaMaker object (from _init_TM_object).
-        @param save_dir Directory for the per-seed diagnostic figures. None -> a
-                        seed_eqdsks_{run_name}/ subfolder. In debug mode this subfolder is
-                        created in the cwd (so the figures are visible during the run);
-                        otherwise it is placed inside a fresh temp dir. Either way the caller
-                        moves it into the run output dir (or cleans up the temp parent).
-        @return (seeds, save_dir): seed records ordered by eq_times, and the figure directory.
+        @param save_dir Directory for the per-seed diagnostic figures (seed_equil_{idx}_*.png),
+                        normally this run's output directory. None -> no figures are drawn,
+                        which is what happens when output_mode is False and there is no
+                        output directory to write them to.
+        @return seeds: seed records ordered by eq_times.
     '''
-    sc = tmtx_config['seed_eqdsk_config']
+    sc = tmtx_config['seed_equil_config']
     run_name = tmtx_config.get('run_name', 'tmp')
 
     Z0 = tmtx_config.get('Z0', 0.0)
@@ -9530,7 +9551,7 @@ def _create_seed_equilibria(tmtx_config, mygs, save_dir=None):
     eq_times = sc.get('eq_times')
     if not eq_times:
         eq_times = np.linspace(tmtx_config['t_sim_start'], tmtx_config['t_sim_end'],
-                               sc.get('num_seed_eqdsks', 10)).tolist()
+                               sc.get('num_seed_equil', 10)).tolist()
     eq_times = [float(t) for t in eq_times]
 
     a_traj     = sc['a']
@@ -9550,19 +9571,8 @@ def _create_seed_equilibria(tmtx_config, mygs, save_dir=None):
     n_surfaces      = sc.get('n_surfaces', tmtx_config.get('n_surfaces', N_SURFACES))
     last_surface_factor = tmtx_config.get('last_surface_factor', 0.9999)
 
-    if save_dir is None:
-        # The seed_eqdsks_{run_name} subfolder name is preserved so run_tmtx_from_config can
-        # move it into the run output dir if needed. In debug mode stage the seeds directly in
-        # the cwd so they are visible while the run is in progress; otherwise stage them inside
-        # a fresh temp dir (cleaned up at end of run when there is no output dir to move into).
-        if _output_mode_is_debug(tmtx_config.get('fly_kwargs', {}).get('output_mode')):
-            save_dir = os.path.abspath(f'seed_eqdsks_{run_name}')
-        else:
-            _tmp_parent = tempfile.mkdtemp(prefix='TokaMaker_TORAX_seeds_')
-            save_dir = os.path.join(_tmp_parent, f'seed_eqdsks_{run_name}')
-    if os.path.exists(save_dir):
-        shutil.rmtree(save_dir)
-    os.makedirs(save_dir)
+    if save_dir is not None:
+        os.makedirs(save_dir, exist_ok=True)
 
     def _is_diverted(t):
         return diverted_window is not None and diverted_window[0] <= t <= diverted_window[1]
@@ -9582,7 +9592,7 @@ def _create_seed_equilibria(tmtx_config, mygs, save_dir=None):
 
         if diverted:
             if x_points is None or diverted_lcfs is None:
-                raise ValueError("diverted_window requires both 'x_points' and 'diverted_lcfs' in seed_eqdsk_config.")
+                raise ValueError("diverted_window requires both 'x_points' and 'diverted_lcfs' in seed_equil_config.")
             mygs.set_saddle_constraints(np.asarray(x_points), weights=np.full(x_points.shape[0], saddle_weight))
             isoflux_pts = np.asarray(diverted_lcfs)
         else:
@@ -9597,10 +9607,13 @@ def _create_seed_equilibria(tmtx_config, mygs, save_dir=None):
         print(f"  [{run_name}] seed {idx:02d}  t={t:.2f}s  Ip={Ip/1e6:.2f} MA  "
               f"{'diverted' if diverted else 'limited'}")
 
-        # Save a diagnostic figure (machine + coil currents + psi contours) alongside each
-        # seed, using the same coil-current colormap idiom as plot_equil. Done for both
-        # successful and failed solves so a failure still yields a psi plot to inspect.
+        # Save a diagnostic figure (machine + coil currents + psi contours) for each seed
+        # into the run output directory, using the same coil-current colormap idiom as
+        # plot_equil. Done for both successful and failed solves so a failure still yields a
+        # psi plot to inspect. Skipped entirely when there is no output directory.
         def _save_seed_fig(ok):
+            if save_dir is None:
+                return
             try:
                 fig, ax = plt.subplots(1, 1, figsize=(8, 9))
                 cb = mygs.plot_machine(fig, ax, coil_colormap='seismic', coil_symmap=False,
@@ -9621,7 +9634,7 @@ def _create_seed_equilibria(tmtx_config, mygs, save_dir=None):
                              fontsize=14, color=('k' if ok else 'darkred'))
                 plt.tight_layout()
                 _suffix = '' if ok else '_FAILED'
-                fig.savefig(os.path.join(save_dir, f"seed_{idx:03d}_{name}{_suffix}.png"),
+                fig.savefig(os.path.join(save_dir, f"seed_equil_{idx:03d}_{name}{_suffix}.png"),
                             dpi=150, bbox_inches='tight')
                 plt.close(fig)
             except Exception as fig_err:
@@ -9647,7 +9660,7 @@ def _create_seed_equilibria(tmtx_config, mygs, save_dir=None):
 
     # Persist the resolved seed times back so reproduction / downstream see the same grid.
     sc['eq_times'] = eq_times
-    return seeds, save_dir
+    return seeds
 
 
 #: tm_inputs coil-regularization keys -> set_TokaMaker_coil_reg() kwargs.
@@ -9703,7 +9716,7 @@ def _apply_coil_config(tmtx, tm_inputs):
 
             All coil configuration lives in tm_inputs under coil_* keys: the single global
             hard bounds (coil_bounds / coil_bounds_units), the regularization weights, and
-            the optional rate limits. The same coil_bounds is used for seed-eqdsk
+            the optional rate limits. The same coil_bounds is used for seed-equilibrium
             generation (_init_TM_object), the coupled GS solves, and the rate-limit clip,
             so the hard limit is specified exactly once.
 
@@ -9735,20 +9748,20 @@ def _init_TMTX_from_configs(tmtx_config, torax_config, mygs):
             grid from its geometry.n_rho / geometry.face_centers).
 
             Required tmtx_config keys: 'R0', 'B0', 'Ip', 't_sim_start', 't_sim_end',
-            'tx_dt', and seed equilibria in 'g_eqdsk_arr' (gEQDSK paths, or the seed records
+            'tx_dt', and seed equilibria in 'seed_equil_arr' (gEQDSK paths, or the seed records
             _create_seed_equilibria returns) with matching seed times in
-            seed_eqdsk_config['eq_times'].
+            seed_equil_config['eq_times'].
 
             @param tmtx_config Dictionary (TMTX config format).
             @param torax_config Dictionary (raw TORAX config).
             @param mygs Configured TokaMaker object.
             @return Initialized TokaMaker_TORAX object (before fly()).
     '''
-    sc = tmtx_config.get('seed_eqdsk_config', {})
+    sc = tmtx_config.get('seed_equil_config', {})
 
-    seeds = tmtx_config.get('g_eqdsk_arr')
+    seeds = tmtx_config.get('seed_equil_arr')
     if not seeds:
-        raise ValueError("tmtx_config['g_eqdsk_arr'] must list the seed equilibria.")
+        raise ValueError("tmtx_config['seed_equil_arr'] must list the seed equilibria.")
 
     eq_times = sc.get('eq_times')
     if not eq_times:
@@ -9756,7 +9769,7 @@ def _init_TMTX_from_configs(tmtx_config, torax_config, mygs):
                                len(seeds)).tolist()
     eq_times = [float(t) for t in eq_times]
     if len(eq_times) != len(seeds):
-        raise ValueError('Length of seed eq_times and g_eqdsk_arr must match '
+        raise ValueError('Length of seed eq_times and seed_equil_arr must match '
                          f'({len(eq_times)} vs {len(seeds)}).')
 
     tm_times = tmtx_config.get('tm_times')
@@ -9829,7 +9842,7 @@ def _init_TMTX_from_configs(tmtx_config, torax_config, mygs):
         tmtx.set_evolve(**tmtx_config['evolve'])
 
     # Stash the original configs so fly()/save_tmtx_config() can write a faithful
-    # reproduction file (keeps seed-eqdsk trajectories and TM mesh inputs).
+    # reproduction file (keeps seed-equilibrium trajectories and TM mesh inputs).
     tmtx._tmtx_config = copy.deepcopy(tmtx_config)
     tmtx._torax_config = copy.deepcopy(torax_config)
 
