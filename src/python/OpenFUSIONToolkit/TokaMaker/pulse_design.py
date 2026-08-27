@@ -481,6 +481,7 @@ class TokaMaker_TORAX:
         self._state['pp_prof_tm']     = {}  # p' from TM solve
         self._state['ffp_prof_tm_prev'] = {}  # ffp_prof_tm from the previous loop (blend reference)
         self._state['pp_prof_tm_prev']  = {}  # pp_prof_tm from the previous loop (blend reference)
+        self._state['p_prof_tm_prev']   = {}  # p_prof_tm from the previous loop (p-space blend reference)
         self._state['j_tot_prev']       = {}  # j_tot (TORAX) from the previous loop (jphi blend reference)
         self._state['p_prof_tm']      = {}  # pressure from TM solve
         self._state['p_prof_tx']      = {}  # pressure from TORAX
@@ -2411,8 +2412,8 @@ class TokaMaker_TORAX:
                 7. If relax_kinetics was True for the last relax, override n_e, T_e, T_i
                    with profiles taken from the end of that relax simulation.
                 8. If fly(..., steady_state_mode=True) and this is not the first loop,
-                   override psi and kinetic profiles with profiles saved from the previous main TORAX run at
-                   t_final (see _capture_steady_state_tx_seed).
+                   override the kinetic profiles with profiles saved from the previous main TORAX run at
+                   t_final (see _capture_steady_state_tx_seed). psi is never carried between loops.
 
                 @return Torax config object.
 
@@ -2479,8 +2480,8 @@ class TokaMaker_TORAX:
             # the TM equilibrium at t_init without a loop N re-relax, the metric changes
             # and j becomes inconsistent.  When relax=False, force seed at t_init.
             # When relax=True, loop N relax aligns psi with TM i=0 — keep TM.
-            # steady_state_mode uses the final TM equilibrium everywhere and seeds psi from the
-            # previous TORAX t_final; do not replace t_init with the seed.
+            # steady_state_mode uses the final TM equilibrium at every TX time; do not
+            # replace t_init with the seed geometry.
             if (self._psi_init is not None and not self._relax
                     and not self._steady_state_mode):
                 seed_geo = self._seeds[0]['geometry']
@@ -2532,23 +2533,21 @@ class TokaMaker_TORAX:
             myconfig['profile_conditions']['T_i'] = self._T_i_init
 
         # ── 8. Steady-state coupling: previous loop TORAX t_final → IC for this loop ──
-        # If an inter-loop relax already ran this loop, its output should define the
-        # main-run ICs (psi always, and kinetics when relax_kinetics=True). In that case
-        # do not overwrite with the raw steady-state seed here.
+        # Kinetics only: psi is re-relaxed from geometry each loop rather than inherited.
+        # If an inter-loop relax already ran this loop, its output defines the main-run ICs
+        # (psi always, and kinetics when relax_kinetics=True), so do not overwrite here.
         if (self._steady_state_mode
                 and not self._coupling_iteration_is_first()
                 and not (self._relax and self._current_loop >= 1)
                 and self._steady_state_tx_seed):
             seed = self._steady_state_tx_seed
             pc = myconfig['profile_conditions']
-            for k in ('psi', 'n_e', 'T_e', 'T_i'):
+            for k in ('n_e', 'T_e', 'T_i'):
                 if k in seed and seed[k] is not None:
                     pc[k] = copy.deepcopy(seed[k])
-            pc['initial_psi_mode'] = 'profile_conditions'
-            pc['initial_psi_from_j'] = False
             self._log(
-                f'Loop {self._current_loop}: steady_state_mode: TORAX initial profiles from '
-                f'previous loop t_final={self._t_final:g} s.'
+                f'Loop {self._current_loop}: steady_state_mode: TORAX initial kinetic profiles from '
+                f'previous loop t_final={self._t_final:g} s (psi from relax/geometry).'
             )
 
         # Snapshot the loop-1 merged TORAX config (BASE_CONFIG + loaded config +
@@ -2709,16 +2708,20 @@ class TokaMaker_TORAX:
         self._relax_profiles_snapshot = snap
 
     def _capture_steady_state_tx_seed(self, data_tree):
-        r'''! Store psi, n_e, T_e, T_i at t_final for steady_state_mode next coupling loop.
+        r'''! Store n_e, T_e, T_i at t_final for steady_state_mode next coupling loop.
 
                 Profile tuples use t_init as the time key (TORAX profile_conditions convention),
                 matching _psi_init / relax snapshots.
+
+                psi is deliberately NOT carried across loops: the current profile is re-relaxed
+                from geometry every loop on the new equilibrium, so it never inherits flux from
+                a previous loop's metric.
 
         '''
         t_fin = float(self._t_final)
         _sel = dict(time=t_fin, method='nearest')
         seed = {}
-        for _name in ('psi', 'n_e', 'T_e', 'T_i'):
+        for _name in ('n_e', 'T_e', 'T_i'):
             _xr = getattr(data_tree.profiles, _name).sel(**_sel)
             _rho = _xr.coords['rho_norm'].to_numpy()
             _arr = _xr.to_numpy()
@@ -3045,14 +3048,15 @@ class TokaMaker_TORAX:
         r'''! Short TORAX relax: initial run on the seed, or inter-loop on the TM i=0 equilibrium.
 
                 Uses flattened user inputs (_apply_tx_set_overrides + _flatten_time_dependent).
-                If prescribed_profiles is None, psi follows initial_psi_mode='geometry'
-                and n_e, T_e, T_i stay as already merged from base / loaded config and
-                _apply_tx_set_overrides (user inputs). If a dict is passed, it must supply
-                psi, n_e, T_e, T_i tuples (advanced; loop N relax uses None so kinetics are always user-specified).
+                psi always follows initial_psi_mode='geometry', so the relax re-derives the
+                current profile from the equilibrium it is handed. If prescribed_profiles is
+                None, n_e, T_e, T_i stay as already merged from base / loaded config and
+                _apply_tx_set_overrides (user inputs); if a dict is passed, its n_e, T_e, T_i
+                tuples override them (steady_state_mode carries kinetics between loops).
 
                 @param stage 'initial' or 'interloop' (logging / output names only).
                 @param geometry Geometry entry (see @ref _tx_geometry) used at t_initial.
-                @param prescribed_profiles None, or dict with keys psi, n_e, T_e, T_i (3-tuples).
+                @param prescribed_profiles None, or dict with n_e, T_e, T_i keys (3-tuples).
 
         '''
         runtime = float(self._relax_duration)
@@ -3088,18 +3092,14 @@ class TokaMaker_TORAX:
                 init_config['numerics'].setdefault('evolve_current', True)
 
             init_config.setdefault('profile_conditions', {})
-            if prescribed_profiles is None:
-                init_config['profile_conditions'].pop('psi', None)
-                init_config['profile_conditions']['initial_psi_mode'] = 'geometry'
-                init_config['profile_conditions']['initial_psi_from_j'] = False
-            else:
-                pc = init_config['profile_conditions']
-                pc['psi'] = copy.deepcopy(prescribed_profiles['psi'])
-                pc['initial_psi_mode'] = 'profile_conditions'
-                pc['initial_psi_from_j'] = False
-                pc['n_e'] = copy.deepcopy(prescribed_profiles['n_e'])
-                pc['T_e'] = copy.deepcopy(prescribed_profiles['T_e'])
-                pc['T_i'] = copy.deepcopy(prescribed_profiles['T_i'])
+            pc = init_config['profile_conditions']
+            pc.pop('psi', None)
+            pc['initial_psi_mode'] = 'geometry'
+            pc['initial_psi_from_j'] = False
+            if prescribed_profiles is not None:
+                for _k in ('n_e', 'T_e', 'T_i'):
+                    if prescribed_profiles.get(_k) is not None:
+                        pc[_k] = copy.deepcopy(prescribed_profiles[_k])
 
             self._flatten_time_dependent(init_config)
 
@@ -3110,10 +3110,6 @@ class TokaMaker_TORAX:
                     _r, _y = TokaMaker_TORAX._relax_flat_profile_to_rho_y(pc_flat[_k])
                     if _r is not None:
                         _user_ref_curves[_k] = (_r, _y)
-            if 'psi' in pc_flat:
-                _r, _y = TokaMaker_TORAX._relax_flat_profile_to_rho_y(pc_flat['psi'])
-                if _r is not None:
-                    _user_ref_curves['psi'] = (_r, _y)
 
             if self._output_mode in ('normal', 'debug') and self._out_dir is not None:
                 if stage == 'initial':
@@ -3211,11 +3207,12 @@ class TokaMaker_TORAX:
                 prescribed_profiles = copy.deepcopy(self._steady_state_tx_seed)
                 self._log(
                     f'Loop {self._current_loop}: steady_state_mode inter-loop relax seeded from '
-                    f'previous loop t_final profiles.'
+                    f'previous loop t_final kinetic profiles (psi relaxed from geometry).'
                 )
-            # If prescribed_profiles is None: existing behavior (user kinetics, psi from geometry).
+            # If prescribed_profiles is None: existing behavior (user kinetics).
             # In steady_state_mode with a captured seed: relax starts from previous loop t_final
-            # profiles on the final-previous-loop equilibrium, then relaxed outputs seed main TORAX.
+            # kinetics on the final-previous-loop equilibrium and re-relaxes psi from that
+            # geometry, then the relaxed outputs seed main TORAX.
             self._run_tx_relax(stage='interloop', geometry=relax_geo, prescribed_profiles=prescribed_profiles)
 
         with self._loop0_coarse_tx_main_scope():
@@ -3511,10 +3508,11 @@ class TokaMaker_TORAX:
         if getattr(self, '_rate_limit_active', False):
             self._push_coil_bounds(self._global_bounds_dict())
 
-        # Snapshot previous loop's TM-solved profiles before they are overwritten,
-        # so _convolve_prof can convolve toward the previous successful solution.
+        # Snapshot previous loop's TM-solved profiles before they are overwritten, so the
+        # convolution helpers can convolve toward the previous successful solution.
         self._state['ffp_prof_tm_prev']  = copy.deepcopy(self._state.get('ffp_prof_tm', {}))
         self._state['pp_prof_tm_prev']   = copy.deepcopy(self._state.get('pp_prof_tm', {}))
+        self._state['p_prof_tm_prev']    = copy.deepcopy(self._state.get('p_prof_tm', {}))
         self._state['ffp_ni_prof_prev']  = copy.deepcopy(self._state.get('ffp_ni_prof', {}))
         self._state['j_tot_prev']        = copy.deepcopy(self._state.get('j_tot', {}))
         self._state['psi_grid_prev_tm'] = {}
@@ -3578,13 +3576,6 @@ class TokaMaker_TORAX:
                 # Tighten coil bounds to the per-solve rate-limited window (A-turns),
                 # centered on the last good solved currents (no-op if rate limiting off).
                 self._apply_rate_limited_bounds(i, t)
-
-                ffp_prof = {'x': self._state['ffp_prof'][i]['x'].copy(),
-                               'y': self._state['ffp_prof'][i]['y'].copy(),
-                               'type': self._state['ffp_prof'][i]['type']}
-                pp_prof = {'x': self._state['pp_prof'][i]['x'].copy(),
-                              'y': self._state['pp_prof'][i]['y'].copy(),
-                              'type': self._state['pp_prof'][i]['type']}
 
                 lcfs = self._state['lcfs_geo'][i]
 
@@ -3690,72 +3681,53 @@ class TokaMaker_TORAX:
                 solve_succeeded = False
                 level_attempts = []
 
-                ffp_prof_raw    = copy.deepcopy(ffp_prof)
-                pp_prof_raw     = copy.deepcopy(pp_prof)
                 ffp_ni_prof_raw = copy.deepcopy(self._state['ffp_ni_prof'][i])
                 jphi_prof_raw   = copy.deepcopy(self._state['j_tot'][i])
 
                 # Reference profiles to convolve the raw TORAX profiles toward. Prefer the
-                # previous loop's profile at this timestep; fall back to an analytic
-                # power-flux shape (ffp/pp), zeros (ffp_ni) or this loop's jphi on loop 1.
-                ffp_prev    = self._state['ffp_prof_tm_prev'].get(i)
-                pp_prev     = self._state['pp_prof_tm_prev'].get(i)
+                # previous loop's profile at this timestep; fall back to zeros (ffp_ni), this
+                # loop's jphi, or an analytic power-flux pressure shape (p) on loop 1.
                 ffp_ni_prev = self._state['ffp_ni_prof_prev'].get(i)
                 jphi_prev   = self._state['j_tot_prev'].get(i)
+                p_prev      = self._state['p_prof_tm_prev'].get(i)
 
-                ffp_ref    = ffp_prev    if ffp_prev    is not None else create_power_flux_fun(N_PSI, 1.5, 2.0)
-                pp_ref     = pp_prev     if pp_prev     is not None else create_power_flux_fun(N_PSI, 4.0, 1.0)
                 ffp_ni_ref = ffp_ni_prev if ffp_ni_prev is not None else {'x': self._psi_N.copy(), 'y': np.zeros_like(self._psi_N), 'type': 'linterp'}
                 jphi_ref   = jphi_prev   if jphi_prev   is not None else jphi_prof_raw
 
+                # p' is convolved in pressure space rather than directly: p peaks on axis, so
+                # _convolve_prof's peak normalization pins the mix at TORAX's pax for every
+                # alpha. Convolving p' directly normalizes on the pedestal instead, which
+                # moves the implied axis pressure. Both ends must be real *pressure* shapes --
+                # feeding an analytic p' shape in here gives a reference with no axis gradient.
+                p_prof_raw = (self._state['p_prof_tx'].get(i)
+                              or self._state['p_prof_equil'].get(i))
+                # Loop 1 has no previous TM pressure, so the seed equilibrium's pressure is the
+                # reference: a physical profile rather than an analytic stand-in.
+                p_ref      = (p_prev
+                              or self._state['p_prof_equil'].get(i)
+                              or self._state['p_prof_tx'].get(i))
+
                 level_profiles = []
 
-                # Levels 1..N: convolve the prescribed-jphi profile toward the previous
-                # loop's jphi over a few alphas, from pure TORAX (alpha=0) to mostly
-                # previous (alpha=1). p' and FF'_NI are convolved at the same alpha and
-                # passed alongside (normal linterp type), matching the FF'/p' levels below.
-                _jphi_alphas = [0.00, 0.50, 1.00]
-                for _a in _jphi_alphas:
+                # Convolve the prescribed-jphi, pressure and FF'_NI profiles toward the previous
+                # loop's solution at a common alpha, from pure TORAX (0) to pure reference (1).
+                _alphas = [0.00, 0.10, 0.25, 0.50, 1.00]
+                for _lv, _a in enumerate(_alphas):
                     _jphi_c   = self._convolve_prof(
                         copy.deepcopy(jphi_prof_raw), jphi_ref, _a, out_type='jphi-linterp',
                     )
-                    _pp_c     = self._convolve_prof(copy.deepcopy(pp_prof_raw),     pp_ref,     _a)
+                    _p_c      = self._convolve_prof(copy.deepcopy(p_prof_raw), p_ref, _a)
+                    _pp_c     = {'x': self._psi_N.copy(),
+                                 'y': np.gradient(_p_c['y'], self._psi_N), 'type': 'linterp'}
                     _ffp_ni_c = self._convolve_prof(copy.deepcopy(ffp_ni_prof_raw), ffp_ni_ref, _a)
-                    level_profiles.append({
-                        'ffp': _jphi_c, 'pp': _pp_c, 'ffp_ni': _ffp_ni_c,
-                        'name': f'jphi_conv{_a:.2f}',
-                    })
-
-                # Remaining levels: switch back to FF'/p', convolving the raw TORAX
-                # profiles toward the reference with independent ffp/pp alpha stepping,
-                # from pure TORAX (alpha=0) to pure analytic/previous (alpha=1).
-                _conv_alphas = [
-                    (0.00, 0.00),
-                    # (0.05, 0.05),
-                    (0.10, 0.10),
-                    # (0.15, 0.15),
-                    (0.20, 0.20),
-                    # (0.30, 0.30),
-                    (0.40, 0.40),
-                    # (0.50, 0.50),
-                    (0.60, 0.60),
-                    # (0.75, 0.75),
-                    (1.00, 1.00),
-                ]
-                for _a_ffp, _a_pp in _conv_alphas:
-                    _ffp_c    = self._convolve_prof(copy.deepcopy(ffp_prof_raw),    ffp_ref,    _a_ffp)
-                    _pp_c     = self._convolve_prof(copy.deepcopy(pp_prof_raw),     pp_ref,     _a_pp)
-                    _ffp_ni_c = self._convolve_prof(copy.deepcopy(ffp_ni_prof_raw), ffp_ni_ref, _a_ffp)
-                    if _a_ffp == 1.0 and _a_pp == 1.0:
-                        lv_name = 'lv99_analytic_profiles'
-                    elif _a_ffp == 0.0 and _a_pp == 0.0:
-                        lv_name = 'lv00_raw_torax_profiles'
-                    elif _a_ffp < 1.0 or _a_pp < 1.0:
-                        lv_name = f'conv_ffp{_a_ffp:.2f}_pp{_a_pp:.2f}'
+                    if _a == 0.0:
+                        lv_name = f'lv{_lv}_raw_profiles'
+                    elif _a == 1.0:
+                        lv_name = f'lv{_lv}_prev_seed_profiles'
                     else:
-                        print(f'TM: Profile convolution received unexpected alpha values: {_a_ffp}, {_a_pp}')
+                        lv_name = f'lv{_lv}_alpha_{_a:g}'
                     level_profiles.append({
-                        'ffp': _ffp_c, 'pp': _pp_c, 'ffp_ni': _ffp_ni_c,
+                        'ffp': _jphi_c, 'pp': _pp_c, 'p': _p_c, 'ffp_ni': _ffp_ni_c,
                         'name': lv_name,
                     })
 
@@ -3774,6 +3746,11 @@ class TokaMaker_TORAX:
                         self._tm.set_psi(self._state['psi_grid_prev_tm'][prev_tm_idx], update_bounds=True)
 
                     try:
+                        # Re-assert the targets for every level: the axis pressure handed to
+                        # TokaMaker is always TORAX's pax, never something the profile fallback
+                        # ladder derived. A prior failed attempt can leave the Fortran-side
+                        # targets mutated, so they are pushed again before each solve.
+                        self._tm.set_targets(Ip=Ip_target, pax=P0_target)
                         self._tm.set_profiles(ffp_prof=ffp_level, pp_prof=pp_level, ffp_NI_prof=level_prof['ffp_ni'])
                         
                         if self._output_mode == 'debug': # allows TM terminal outputs in debug mode
@@ -3794,14 +3771,15 @@ class TokaMaker_TORAX:
 
                         level_attempts.append({'level': level_idx, 'name': level_name,
                                               'ffp': ffp_level, 'pp': pp_level,
+                                              'p': level_prof.get('p'),
                                               'ffp_ni': level_prof['ffp_ni'],
                                               'succeeded': True, 'error': None, 'nl_its': _nl_its})
-                        ffp_prof, pp_prof = ffp_level, pp_level
                         solve_succeeded = True
                         break
                     except Exception as e:
                         level_attempts.append({'level': level_idx, 'name': level_name,
                                               'ffp': ffp_level, 'pp': pp_level,
+                                              'p': level_prof.get('p'),
                                               'ffp_ni': level_prof['ffp_ni'],
                                               'succeeded': False, 'error': str(e)})
                         if self._output_mode == 'debug' and self._out_dir is not None:
@@ -3973,7 +3951,9 @@ class TokaMaker_TORAX:
                   + _skip_note
                   + (f' Failures: {n_fail}.' if n_fail else ''))
 
-        if self._debug_mode:
+        # Per-loop TM summary table: emitted for every output mode with a directory, so the
+        # per-timestep level/failure breakdown is always on disk next to the loop's scalars.
+        if self._out_dir is not None:
             summary_name = f'tm_summary_loop{self._current_loop:03d}.png'
             if self._output_file_tag is not None:
                 summary_name = f'{self._output_file_tag}_{summary_name}'
@@ -4442,27 +4422,29 @@ class TokaMaker_TORAX:
                        TokaMaker_TORAX_log_{run_name}_{timestamp}.log in cwd). No plots or config files.
 
                        'minimal' — Per completed coupling loop: scalars_loop{N}.png,
-                       PLH_components_loop{N}.png. At end of run (non-Jupyter): profile_evolution.png,
-                       lcfs_evolution.png, movie_loop{N}.mp4 (N = last completed loop index).
+                       PLH_components_loop{N}.png, tm_summary_loop{N}.png. At end of run
+                       (non-Jupyter): profile_evolution.png, lcfs_evolution.png,
+                       movie_loop{N}.mp4 (N = last completed loop index).
                        On TokaMaker GS failure at a timestep: tm_diag_loop{N}_tidx{i}.png. On TORAX
                        failure: scalars_loop{N}_torax_failed.png and, if partial TORAX data exist,
                        profile_loop{N}_torax_failed_tfinal.png. No TORAX config .py files, no
                        per-timestep profile plots, no relax-profile figures.
                 
                        'normal' (also output_mode=True) — Per loop: scalars_loop{N}.png,
-                       PLH_components_loop{N}.png; tx_config_loop{N}.py; initial / inter-loop relax
+                       PLH_components_loop{N}.png, tm_summary_loop{N}.png; tx_config_loop{N}.py;
+                       initial / inter-loop relax
                        configs tx_config_relax000_initial.py and tx_config_relax_inter_{N}.py; each
                        successful TokaMaker timestep profile_loop{N}_tidx{i}.png. At end (non-Jupyter):
                        profile_evolution.png and movie_loop{N}.mp4 (no lcfs_evolution.png).
                        Same failure plots as minimal. No tm_diag on successful solves, no
-                       relax-profile figures, no tm_summary_loop{N}.png.
+                       relax-profile figures.
                 
                        'debug' — All normal artifacts plus lcfs_evolution.png at end of run.
                        Initial / inter-loop relax: tx_relax_profiles_initial.png,
                        tx_relax_profiles_inter_loop{N}.png. Every TokaMaker timestep (success or fail):
                        tm_diag_loop{N}_tidx{i}.png (successful solves also get profile_loop{N}_tidx{i}.png).
-                       After each loop: tm_summary_loop{N}.png. Python logging (TORAX, JAX, etc.) is
-                       redirected to the log file; per-loop wall time is printed.
+                       Python logging (TORAX, JAX, etc.) is redirected to the log file;
+                       per-loop wall time is printed.
                 @param skip_bad_init_equil If True, skip seed equilibria TORAX rejects instead of raising.
                 @param run_timestamp Timestamp string for the output directory and log file names.
                        Default None -> stamped when fly() is called. run_tmtx_from_config() passes
@@ -6550,15 +6532,28 @@ def tm_diagnostic_plot(tt, i, t, level_attempts, solve_succeeded, save_path=None
 
     _level_colors = plt.cm.tab20.colors
 
+    def _norm_shape(y):
+        """Normalized shape: peak 1, dominant sign positive.
+
+        These panels overlay profiles carried in opposite conventions (TORAX p' is negative,
+        TokaMaker's is positive), so normalizing on the signed peak puts every curve in the
+        same orientation and the shapes can actually be compared.
+        """
+        y = np.asarray(y, dtype=float).copy()
+        peak = np.max(np.abs(y))
+        if peak <= 0:
+            return y
+        sign = -1.0 if np.sum(y < 0) > np.sum(y > 0) else 1.0
+        return y / (sign * peak)
+
     def _plot_levels(ax, key, seed_x=None, seed_y=None, seed_label=None, level_filter=None):
         for attempt in level_attempts:
             if level_filter is not None and not level_filter(attempt):
                 continue
+            if attempt.get(key) is None:
+                continue
             color = _level_colors[attempt['level'] % len(_level_colors)]
-            y_data = attempt[key]['y'].copy()
-            peak = np.max(np.abs(y_data))
-            if peak > 0:
-                y_data = y_data / peak
+            y_data = _norm_shape(attempt[key]['y'])
             if attempt['succeeded']:
                 ax.plot(attempt[key]['x'], y_data, color=color, linewidth=2.5, zorder=5,
                         label=f"Level {attempt['level']}: {attempt['name']} \u2713",
@@ -6567,7 +6562,7 @@ def tm_diagnostic_plot(tt, i, t, level_attempts, solve_succeeded, save_path=None
                 ax.plot(attempt[key]['x'], y_data, color=color, linewidth=1.2, linestyle='--', alpha=0.6,
                         label=f"Level {attempt['level']}: {attempt['name']} \u2717")
         if seed_x is not None:
-            ax.plot(seed_x, seed_y, 'k--', linewidth=1.5, alpha=0.7, label=seed_label)
+            ax.plot(seed_x, _norm_shape(seed_y), 'k--', linewidth=1.5, alpha=0.7, label=seed_label)
 
     def render_table(ax, rows, title):
         ax.axis('off')
@@ -6597,16 +6592,9 @@ def tm_diagnostic_plot(tt, i, t, level_attempts, solve_succeeded, save_path=None
     beta_pol_tx = float(s['beta_pol'][i])
     beta_n_tx = float(s['beta_N_tx'][i])
 
-    _seed_ffp_prof = s.get('ffp_prof_equil', {}).get(i)
     _seed_pp_prof = s.get('pp_prof_equil', {}).get(i)
+    _seed_p_prof = s.get('p_prof_equil', {}).get(i)
     _seed_q_prof = s.get('q_prof_equil', {}).get(i)
-
-    _seed_ffp_x = _seed_ffp_norm = None
-    if _seed_ffp_prof is not None:
-        _seed_ffp_x = np.asarray(_seed_ffp_prof.get('x', []), dtype=float)
-        _seed_ffp_norm = np.asarray(_seed_ffp_prof.get('y', []), dtype=float)
-        if _seed_ffp_x.size == 0 or _seed_ffp_norm.size == 0:
-            _seed_ffp_x, _seed_ffp_norm = None, None
 
     _seed_pp_x = _seed_pp_norm = None
     if _seed_pp_prof is not None:
@@ -6615,9 +6603,20 @@ def tm_diagnostic_plot(tt, i, t, level_attempts, solve_succeeded, save_path=None
         if _seed_pp_x.size == 0 or _seed_pp_norm.size == 0:
             _seed_pp_x, _seed_pp_norm = None, None
 
+    _seed_p_x = _seed_p_norm = None
+    if _seed_p_prof is not None:
+        _seed_p_x = np.asarray(_seed_p_prof.get('x', []), dtype=float)
+        _seed_p_norm = np.asarray(_seed_p_prof.get('y', []), dtype=float)
+        if _seed_p_x.size == 0 or _seed_p_norm.size == 0:
+            _seed_p_x, _seed_p_norm = None, None
+
     # Previous-loop TM profiles (blend reference; real units, same as ffp_prof_tm/pp_prof_tm).
     _prev_ffp_prof = s.get('ffp_prof_tm_prev', {}).get(i)
     _prev_pp_prof  = s.get('pp_prof_tm_prev',  {}).get(i)
+    # Pressure convolution inputs: the raw TORAX p that the alpha=0 level carries, and the
+    # last solved TM p it is convolved toward.
+    _prev_p_prof   = s.get('p_prof_tm_prev',   {}).get(i)
+    _raw_p_prof    = s.get('p_prof_tx',        {}).get(i)
 
     # jphi (prescribed-current) inputs: the raw TORAX j_total fed into the early levels,
     # and the reference it is convolved toward (previous loop's j_total, or the raw j_total
@@ -6647,7 +6646,7 @@ def tm_diagnostic_plot(tt, i, t, level_attempts, solve_succeeded, save_path=None
     fig = plt.figure(figsize=(27, 15))
     gs_layout = fig.add_gridspec(4, 9, hspace=0.70, wspace=0.55)
 
-    ax_ffp_tx = fig.add_subplot(gs_layout[0, 0:2])
+    ax_p_tx = fig.add_subplot(gs_layout[0, 0:2])
     ax_pp_tx = fig.add_subplot(gs_layout[1, 0:2])
     ax_eta = fig.add_subplot(gs_layout[2, 0:1])
     ax_ffp_ni = fig.add_subplot(gs_layout[2, 1:2])
@@ -6660,36 +6659,30 @@ def tm_diagnostic_plot(tt, i, t, level_attempts, solve_succeeded, save_path=None
     ax_eq = fig.add_subplot(gs_layout[0:3, 6:9])
     ax_coil = fig.add_subplot(gs_layout[3, 6:9])
 
-    # FF'/p'/FF'_NI panels show only the FF'-family levels; the jphi-convolution levels
-    # (also stored under 'ffp') get their own panel below so the two are not conflated.
-    def _not_jphi(att):
-        return not _is_jphi_attempt(att)
-
-    _plot_levels(ax_ffp_tx, 'ffp', seed_x=_seed_ffp_x, seed_y=_seed_ffp_norm, seed_label="FF' seed (norm)", level_filter=_not_jphi)
-    if _prev_ffp_prof is not None:
-        _pffp_y = np.asarray(_prev_ffp_prof['y'], dtype=float)
-        _pffp_peak = np.max(np.abs(_pffp_y))
-        if _pffp_peak > 0:
-            _pffp_y = _pffp_y / _pffp_peak
-        ax_ffp_tx.plot(_prev_ffp_prof['x'], _pffp_y, color='tab:purple', lw=1.5, ls='-.', alpha=0.85,
-                       label=f"FF' loop {tt._current_loop - 1} TM (norm)")
-    ax_ffp_tx.set_title("FF' tried levels (norm)", fontsize=10)
-    ax_ffp_tx.set_xlabel(r'$\hat{\psi}$')
-    ax_ffp_tx.set_ylabel("FF' (norm)")
-    ax_ffp_tx.grid(True, alpha=0.3)
-    ax_ffp_tx.axhline(0, color='k', linewidth=0.5)
+    # p (pressure) tried levels: these are what is actually convolved -- p' is the derivative
+    # of the mix -- so the pressure panel leads the p' panel below.
+    _plot_levels(ax_p_tx, 'p', seed_x=_seed_p_x, seed_y=_seed_p_norm, seed_label='p seed (norm)')
+    if _raw_p_prof is not None:
+        ax_p_tx.plot(_raw_p_prof['x'], _norm_shape(_raw_p_prof['y']), color='k', lw=1.5, alpha=0.8,
+                     label=f'p loop {tt._current_loop} TX raw (norm)')
+    if _prev_p_prof is not None:
+        ax_p_tx.plot(_prev_p_prof['x'], _norm_shape(_prev_p_prof['y']),
+                     color='tab:purple', lw=1.5, ls='-.', alpha=0.85,
+                     label=f'p loop {tt._current_loop - 1} TM (conv. ref, norm)')
+    ax_p_tx.set_title('p tried levels (norm)', fontsize=10)
+    ax_p_tx.set_xlabel(r'$\hat{\psi}$')
+    ax_p_tx.set_ylabel('p (norm)')
+    ax_p_tx.grid(True, alpha=0.3)
+    ax_p_tx.axhline(0, color='k', linewidth=0.5)
 
     _plot_levels(ax_pp_tx, 'pp', seed_x=_seed_pp_x, seed_y=_seed_pp_norm, seed_label="p' seed (norm)")
     if _prev_pp_prof is not None:
-        _ppp_y = np.asarray(_prev_pp_prof['y'], dtype=float)
-        _ppp_peak = np.max(np.abs(_ppp_y))
-        if _ppp_peak > 0:
-            _ppp_y = _ppp_y / _ppp_peak
-        ax_pp_tx.plot(_prev_pp_prof['x'], _ppp_y, color='tab:purple', lw=1.5, ls='-.', alpha=0.85,
+        ax_pp_tx.plot(_prev_pp_prof['x'], _norm_shape(_prev_pp_prof['y']),
+                      color='tab:purple', lw=1.5, ls='-.', alpha=0.85,
                       label=f"p' loop {tt._current_loop - 1} TM (norm)")
-    ax_pp_tx.set_title("p' tried levels (normalized)", fontsize=10)
+    ax_pp_tx.set_title("p' tried levels (norm)", fontsize=10)
     ax_pp_tx.set_xlabel(r'$\hat{\psi}$')
-    ax_pp_tx.set_ylabel("p' (norm)")
+    ax_pp_tx.set_ylabel(r"p' (norm, $dp/d\hat{\psi}$)")
     ax_pp_tx.grid(True, alpha=0.3)
 
     ax_eta.plot(s['eta_prof'][i]['x'], s['eta_prof'][i]['y'], 'r-', linewidth=2)
@@ -6702,11 +6695,8 @@ def tm_diagnostic_plot(tt, i, t, level_attempts, solve_succeeded, save_path=None
     _prev_ffp_ni_prof = s.get('ffp_ni_prof_prev', {}).get(i)
     _plot_levels(ax_ffp_ni, 'ffp_ni')
     if _prev_ffp_ni_prof is not None:
-        _prev_ni_y = np.asarray(_prev_ffp_ni_prof['y'], dtype=float)
-        _prev_ni_peak = np.max(np.abs(_prev_ni_y))
-        if _prev_ni_peak > 0:
-            _prev_ni_y = _prev_ni_y / _prev_ni_peak
-        ax_ffp_ni.plot(_prev_ffp_ni_prof['x'], _prev_ni_y, color='tab:purple', lw=1.5, ls='-.', alpha=0.85,
+        ax_ffp_ni.plot(_prev_ffp_ni_prof['x'], _norm_shape(_prev_ffp_ni_prof['y']),
+                       color='tab:purple', lw=1.5, ls='-.', alpha=0.85,
                        label=f"FF'_NI loop {tt._current_loop - 1} (norm)")
     ax_ffp_ni.set_title("FF'_NI tried levels (norm)", fontsize=10)
     ax_ffp_ni.set_xlabel(r'$\hat{\psi}$')
@@ -6758,11 +6748,11 @@ def tm_diagnostic_plot(tt, i, t, level_attempts, solve_succeeded, save_path=None
     fig.text(0.5, 0.965, _input_note, ha='center', va='top', fontsize=11,
              color=_note_color, fontweight='bold')
 
-    # Single shared legend for the left three profile panels, placed below ax_ffp_tx.
-    _legend_handles, _legend_labels = ax_ffp_tx.get_legend_handles_labels()
-    ax_ffp_tx.legend(_legend_handles, _legend_labels,
-                     fontsize=7, loc='upper center',
-                     bbox_to_anchor=(0.5, -0.30), ncol=2, framealpha=0.92)
+    # Single shared legend for the left profile panels, placed below ax_p_tx.
+    _legend_handles, _legend_labels = ax_p_tx.get_legend_handles_labels()
+    ax_p_tx.legend(_legend_handles, _legend_labels,
+                   fontsize=6, loc='upper center',
+                   bbox_to_anchor=(0.5, -0.30), ncol=3, framealpha=0.92)
 
     # ── Unified scalar table (same rows and columns whether or not the solve succeeded;
     #    a column simply has no value to report for some rows, which renders as an em dash) ──
@@ -7982,7 +7972,7 @@ def plot_coupling_convergence(tt, save_path=None, display=True):
     cost_mean = [h['cost_mean'] for h in hist]
     cost_max = [h['cost_max'] for h in hist]
 
-    fig, (ax_tot, ax_ch) = plt.subplots(1, 2, figsize=(13, 4.5))
+    fig, (ax_tot, ax_ch) = plt.subplots(1, 2, figsize=(15, 4.5))
 
     ax_tot.plot(loops, cost_mean, color=COLOR_TM, marker='o', ms=5, lw=1.5, label='mean over time')
     ax_tot.plot(loops, cost_max, color='crimson', marker='s', ms=4, lw=1.2, ls='--', label='max over time')
@@ -7992,7 +7982,8 @@ def plot_coupling_convergence(tt, save_path=None, display=True):
     if np.any(np.asarray(cost_mean, dtype=float) > 0):
         ax_tot.set_yscale('log')
     ax_tot.grid(True, alpha=0.3, which='both')
-    ax_tot.legend(fontsize=8)
+    ax_tot.legend(fontsize=8, loc='upper left', bbox_to_anchor=(1.02, 1.0),
+                  borderaxespad=0.0, frameon=False)
     if len(loops) > 1:
         ax_tot.set_xticks(loops)
 
@@ -8011,7 +8002,8 @@ def plot_coupling_convergence(tt, save_path=None, display=True):
     if np.any(np.isfinite([h['per_channel_mean'].get(c, np.nan) for h in hist for c in channels])):
         ax_ch.set_yscale('log')
     ax_ch.grid(True, alpha=0.3, which='both')
-    ax_ch.legend(fontsize=7, ncol=2, loc='upper right')
+    ax_ch.legend(fontsize=7, ncol=1, loc='upper left', bbox_to_anchor=(1.02, 1.0),
+                 borderaxespad=0.0, frameon=False)
     if len(loops) > 1:
         ax_ch.set_xticks(loops)
 
