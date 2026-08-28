@@ -36,7 +36,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.colors import Normalize
 from matplotlib.gridspec import GridSpec
-from scipy.interpolate import CubicSpline, interp1d
+from scipy.interpolate import CubicSpline, PchipInterpolator, interp1d
 from scipy.ndimage import gaussian_filter1d
 from scipy.signal import savgol_filter
 
@@ -1975,12 +1975,20 @@ class TokaMaker_TORAX:
 
     # ── Profile extraction ──────────────────────────────────────────────────
 
-    def _interp_tx_profile_onto_psi(self, data_tree, var_name, time, profile_type='linterp'):
+    def _interp_tx_profile_onto_psi(self, data_tree, var_name, time, profile_type='linterp',
+                                    interp_kind='linear'):
         r'''! Interpolate a single TORAX profile snapshot onto self._psi_N.
 
                 No averaging, just one timeslice.
                 Returns a plain numpy array on self._psi_N.
 
+                @param interp_kind 'linear' or 'pchip'. self._psi_N is far finer than
+                       TORAX's radial grid, so a linear resample is piecewise-linear with
+                       kinks at the TORAX points -- fine for the profile itself, but any
+                       d/dpsi taken from it comes out as a staircase with one plateau per
+                       TORAX cell. Use 'pchip' for profiles that get differentiated later
+                       (pressure); it is C1 and, unlike a cubic spline, cannot overshoot
+                       at the pedestal foot.
         '''
         var = getattr(data_tree.profiles, var_name)
         var_data = var.sel(time=time, method='nearest').to_numpy()
@@ -2013,12 +2021,21 @@ class TokaMaker_TORAX:
         left_fill  = float(var_data[0])
         right_fill = 0.0 if profile_type == 'jphi-linterp' else float(var_data[-1])
 
+        # PCHIP needs a strictly increasing abscissa and has no fill_value of its own;
+        # evaluate on a clipped grid and apply the same constant fills as the linear path.
+        if interp_kind == 'pchip' and np.all(np.diff(psi_on_grid_real) > 0.0):
+            x_eval = np.clip(self._psi_N, psi_on_grid_real[0], psi_on_grid_real[-1])
+            out = PchipInterpolator(psi_on_grid_real, var_data)(x_eval)
+            out[self._psi_N < psi_on_grid_real[0]] = left_fill
+            out[self._psi_N > psi_on_grid_real[-1]] = right_fill
+            return out
+
         return interp1d(psi_on_grid_real, var_data, kind='linear',
                         fill_value=(left_fill, right_fill),
                         bounds_error=False)(self._psi_N)
 
     def _extract_tx_profile(self, data_tree, var_name, time, load_into_state='state',
-                            normalize=False, profile_type='linterp'):
+                            normalize=False, profile_type='linterp', interp_kind='linear'):
         r'''! Extract a TORAX profile onto self._psi_N with optional time-averaging.
 
                 Replaces the former _pull_tx_onto_psi.  When time-averaging is active
@@ -2031,6 +2048,8 @@ class TokaMaker_TORAX:
                 @param load_into_state  'state' → return dict; else return plain array.
                 @param normalize     If True, normalize profile by the core value.
                 @param profile_type  'linterp' or 'jphi-linterp'.
+                @param interp_kind   'linear' or 'pchip' resample onto self._psi_N; see
+                                     @ref _interp_tx_profile_onto_psi.
 
         '''
         tx_times = data_tree.profiles.psi.coords['time'].values
@@ -2038,16 +2057,16 @@ class TokaMaker_TORAX:
 
         if t_start == t_end:
             # No averaging — single snapshot
-            data_on_psi = self._interp_tx_profile_onto_psi(data_tree, var_name, time, profile_type)
+            data_on_psi = self._interp_tx_profile_onto_psi(data_tree, var_name, time, profile_type, interp_kind)
         else:
             # Collect all TORAX timesteps inside the window
             mask = (tx_times >= t_start) & (tx_times <= t_end)
             win_times = tx_times[mask]
             if len(win_times) == 0:
-                data_on_psi = self._interp_tx_profile_onto_psi(data_tree, var_name, time, profile_type)
+                data_on_psi = self._interp_tx_profile_onto_psi(data_tree, var_name, time, profile_type, interp_kind)
             else:
                 stack = np.stack([
-                    self._interp_tx_profile_onto_psi(data_tree, var_name, wt, profile_type)
+                    self._interp_tx_profile_onto_psi(data_tree, var_name, wt, profile_type, interp_kind)
                     for wt in win_times
                 ])
                 data_on_psi = np.mean(stack, axis=0)
@@ -3306,7 +3325,8 @@ class TokaMaker_TORAX:
         # ── Source profiles for GS solve (FF', p', resistivity) ─────────────
         self._state['ffp_prof'][i]  = self._extract_tx_profile(data_tree, 'FFprime', t)
         self._state['pp_prof'][i]   = self._extract_tx_profile(data_tree, 'pprime',  t)
-        self._state['p_prof_tx'][i] = self._extract_tx_profile(data_tree, 'pressure_thermal_total', t)
+        self._state['p_prof_tx'][i] = self._extract_tx_profile(data_tree, 'pressure_thermal_total', t,
+                                                               interp_kind='pchip')
 
         self._state['ffp_prof_tx'][i] = self._extract_tx_profile(data_tree, 'FFprime', t)
         self._state['ffp_prof_tx'][i]['y'] *= -2.0 * np.pi  # TX → TM units
