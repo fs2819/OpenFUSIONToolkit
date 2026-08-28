@@ -5147,7 +5147,13 @@ class TokaMaker_TORAX:
         tmtx_dict['run_name'] = run_name
         tmtx_dict['t_sim_start'] = float(self._t_init)
         tmtx_dict['t_sim_end'] = float(self._t_final)
-        tmtx_dict['tx_dt'] = float(self._tx_dt)
+        # Catches if tx_dt is a dict or a scalar
+        if isinstance(self._tx_dt, dict):
+            tmtx_dict['tx_dt'] = {float(k): float(v) for k, v in self._tx_dt.items()}
+        elif np.isscalar(self._tx_dt):
+            tmtx_dict['tx_dt'] = float(self._tx_dt)
+        else:
+            tmtx_dict['tx_dt'] = copy.deepcopy(self._tx_dt)
         tmtx_dict['last_surface_factor'] = float(self._last_surface_factor)
         tmtx_dict['truncate_eq'] = bool(self._truncate_eq)
         tmtx_dict['Ip'] = self._Ip
