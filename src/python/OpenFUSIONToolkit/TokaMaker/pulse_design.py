@@ -795,6 +795,8 @@ class TokaMaker_TORAX:
         self._x_point_weight = 1000.0
         self._secondary_x_point_targets = None  # optional corner nulls; excluded from trim_lcfs
         self._secondary_x_point_weight = None   # None -> falls back to _x_point_weight
+        self._secondary_x_point_isoflux = False           # also hold the secondary nulls on the LCFS flux
+        self._secondary_x_point_isoflux_weight = None     # None -> falls back to _isoflux_weight
         self._strike_point_targets = None
         self._strike_point_weight = None        # None -> falls back to _isoflux_weight
         self._trim_lcfs = True
@@ -1217,7 +1219,8 @@ class TokaMaker_TORAX:
 
                 @param isoflux_weight Weight on the LCFS shape (isoflux) targets — the seed-gEQDSK
                        boundary, or the set_diverted_shape_targets() shape_target override while
-                       diverted. Also the fallback weight for strike points. Default 100.0.
+                       diverted. Also the fallback weight for strike points and for secondary
+                       X-point isoflux targets. Default 100.0.
                 @param psi_lcfs_weight Weight on the LCFS psi-value constraint, applied at the
                        single outboard-midplane point using the TORAX psi_lcfs. Default 1000.0.
         '''
@@ -1820,7 +1823,8 @@ class TokaMaker_TORAX:
     def set_diverted_shape_targets(self, diverted_times=None, x_point_targets=None, x_point_weight=1000.0,
                                    strike_point_targets=None, trim_lcfs=True, trim_lcfs_perc_limit=0.80,
                                    secondary_x_point_targets=None, shape_target=None,
-                                   secondary_x_point_weight=None, strike_point_weight=None):
+                                   secondary_x_point_weight=None, strike_point_weight=None,
+                                   secondary_x_point_isoflux=False, secondary_x_point_isoflux_weight=None):
         r'''! Configure the diverted window: X-point targets, strike points, and the optional
                 LCFS shape target — plus the weights of the constraints that only exist while
                 diverted. The always-on weights (LCFS shape isoflux and the outboard-midplane
@@ -1864,6 +1868,19 @@ class TokaMaker_TORAX:
                                            shape targets, matching the previous behavior (strike
                                            points are appended to the shape targets); set it to pull
                                            on the strike points independently of the shape.
+                @param secondary_x_point_isoflux When True, the secondary X-points are ALSO isoflux
+                                                 targets while diverted. A saddle constraint only sets
+                                                 B_pol = 0 at the point and says nothing about psi there;
+                                                 the isoflux constraint ties psi at each secondary null
+                                                 to psi on the LCFS, so the secondary separatrix
+                                                 coincides with the primary one. Like the saddles, these
+                                                 points never enter the `trim_lcfs` calculation.
+                                                 Requires secondary_x_point_targets. Default False
+                                                 (saddle constraints only).
+                @param secondary_x_point_isoflux_weight Weight for the secondary X-point isoflux
+                                                        constraints. None (default) reuses the
+                                                        isoflux_weight applied to the LCFS shape
+                                                        targets.
 
         '''
         if diverted_times is not None and len(diverted_times) != 2:
@@ -1878,6 +1895,11 @@ class TokaMaker_TORAX:
             raise ValueError('secondary_x_point_targets requires x_point_targets (the primary nulls).')
         self._secondary_x_point_weight = (None if secondary_x_point_weight is None
                                           else float(secondary_x_point_weight))
+        if secondary_x_point_isoflux and self._secondary_x_point_targets is None:
+            raise ValueError('secondary_x_point_isoflux=True requires secondary_x_point_targets.')
+        self._secondary_x_point_isoflux = bool(secondary_x_point_isoflux)
+        self._secondary_x_point_isoflux_weight = (None if secondary_x_point_isoflux_weight is None
+                                                  else float(secondary_x_point_isoflux_weight))
         self._strike_point_targets = None if strike_point_targets is None else np.atleast_2d(strike_point_targets)
         self._strike_point_weight = (None if strike_point_weight is None
                                      else float(strike_point_weight))
@@ -3660,14 +3682,27 @@ class TokaMaker_TORAX:
                     lcfs = np.vstack([lcfs, self._strike_point_targets])
                 else:
                     self._state['strike_pts'][i] = np.empty((0, 2))
+                n_strike = len(lcfs) - n_shape
+
+                # When diverted and requested, the secondary nulls are isoflux targets too, so
+                # psi at each one equals psi on the LCFS (a saddle constraint alone leaves it
+                # free). Appended last, after the trim, which never sees them.
+                n_secondary_iso = 0
+                if use_x_points and self._secondary_x_point_isoflux:
+                    lcfs = np.vstack([lcfs, self._secondary_x_point_targets])
+                    n_secondary_iso = self._secondary_x_point_targets.shape[0]
 
                 # Strike points take their own weight when set, else the shape weight (the
                 # previous behavior, where they inherited it by being appended to the shape).
+                # Same fallback for the secondary-null isoflux weight.
                 strike_weight = (self._isoflux_weight if self._strike_point_weight is None
                                  else self._strike_point_weight)
+                secondary_iso_weight = (self._isoflux_weight if self._secondary_x_point_isoflux_weight is None
+                                        else self._secondary_x_point_isoflux_weight)
                 isoflux_weights = np.concatenate([
                     self._isoflux_weight * np.ones(n_shape),
-                    strike_weight * np.ones(len(lcfs) - n_shape),
+                    strike_weight * np.ones(n_strike),
+                    secondary_iso_weight * np.ones(n_secondary_iso),
                 ])
                 lcfs_psi_target = self._state['psi_lcfs_tx'][i] # _state in Wb/rad, TM uses Wb/rad (AKA Wb-rad)
 
@@ -4201,9 +4236,15 @@ class TokaMaker_TORAX:
             s['err_p_rms'][i]   = _rms_prof_diff(s['p_prof_tm'].get(i),   s['p_prof_tx'].get(i))
 
             # ── LCFS shape RMS: min distance of each isoflux target (as actually set —
-            #    trimmed near X-points, strike points folded in) to the achieved LCFS ──
-            s['err_lcfs_rms'][i] = _lcfs_shape_rms(
-                s['isoflux_targets'].get(i), s['lcfs_geo_tm'].get(i))
+            #    trimmed near X-points, strike points folded in) to the achieved LCFS.
+            #    Secondary nulls set as isoflux targets are dropped: they sit far off the LCFS
+            #    by design, and _run_tm appends them last. ──
+            iso = s['isoflux_targets'].get(i)
+            sec = self._secondary_x_point_targets
+            if (iso is not None and self._secondary_x_point_isoflux
+                    and len(iso) > len(sec) and np.array_equal(iso[-len(sec):], sec)):
+                iso = iso[:-len(sec)]
+            s['err_lcfs_rms'][i] = _lcfs_shape_rms(iso, s['lcfs_geo_tm'].get(i))
 
             # ── X-point RMS: only meaningful inside the diverted window, where the
             #    saddle constraints are active. Primary and secondary reported separately,
@@ -5193,6 +5234,9 @@ class TokaMaker_TORAX:
                                           else np.asarray(self._secondary_x_point_targets)),
             'secondary_x_point_weight': (None if self._secondary_x_point_weight is None
                                          else float(self._secondary_x_point_weight)),
+            'secondary_x_point_isoflux': bool(self._secondary_x_point_isoflux),
+            'secondary_x_point_isoflux_weight': (None if self._secondary_x_point_isoflux_weight is None
+                                                 else float(self._secondary_x_point_isoflux_weight)),
             'strike_point_targets': (None if self._strike_point_targets is None
                                      else np.asarray(self._strike_point_targets)),
             'strike_point_weight': (None if self._strike_point_weight is None
@@ -8248,14 +8292,17 @@ def _coil_net_turns(tt, cname):
 
 
 def _coil_aturn_clim(tt):
-    r'''! Return (min, max) colormap limits in A-turns from _coil_bounds (stored in A-turns).'''
-    coil_bounds = getattr(tt, '_coil_bounds', {})
-    if not coil_bounds:
-        return -1.0, 1.0
+    r'''! Return (min, max) colormap limits in A-turns for plot_machine's coil shading.'''
     vals = []
-    for lo, hi in coil_bounds.values():
-        vals.extend([lo, hi])
-    return min(vals), max(vals)
+    for cname, bounds in getattr(tt, '_coil_bounds', {}).items():
+        # plot_machine shades by per-REGION A-turns, so scale the per-set bound down from
+        # net_turns (the sum over the set) to the turns of its most-wound single coil.
+        sub_coils = tt._tm.coil_sets.get(cname, {}).get('sub_coils', [])
+        n_max = max((c.get('nturns', 1.0) for c in sub_coils), default=1.0)
+        n_net = _coil_net_turns(tt, cname) or 1.0
+        vals.extend([b / n_net * n_max for b in bounds])
+    vals = [v for v in vals if v]   # zero-turn virtual coils shade nothing
+    return (min(vals), max(vals)) if vals else (-1.0, 1.0)
 
 
 def plot_coils(tt, save_path=None, display=True):
@@ -9412,6 +9459,18 @@ def _init_TM_object(tmtx_config):
     mygs  = TokaMaker(myOFT)
 
     mesh_pts, mesh_lc, mesh_reg, coil_dict, cond_dict = load_gs_mesh(tm_inputs['mesh_file'])
+    # Series-wire coil groups. Every coil whose 'coil_set' field matches collapses into a
+    # single TokaMaker DOF, and that DOF is the per-winding current I [A/turn], so grouped
+    # coils carry the same conductor current for all time while their A-turns (I*nturns)
+    # differ with their own turn counts -- exactly a series connection. This must happen
+    # before setup_regions, which is where the grouping is read.
+    for _set_name, _members in tm_inputs.get('coil_groups', {}).items():
+        _unknown = [m for m in _members if m not in coil_dict]
+        if _unknown:
+            raise KeyError(f'coil_groups[{_set_name!r}]: unknown coil(s) {_unknown}; '
+                           f'mesh defines {list(coil_dict)}')
+        for _member in _members:
+            coil_dict[_member]['coil_set'] = _set_name
     mygs.setup_mesh(mesh_pts, mesh_lc, mesh_reg)
     mygs.setup_regions(cond_dict=cond_dict, coil_dict=coil_dict)
     mygs.settings.maxits = tm_inputs.get('maxits', 100)
