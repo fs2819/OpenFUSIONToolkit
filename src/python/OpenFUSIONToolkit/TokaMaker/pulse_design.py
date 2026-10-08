@@ -45,7 +45,7 @@ from OpenFUSIONToolkit.TokaMaker.util import read_eqdsk, create_power_flux_fun, 
 LCFS_WEIGHT = 100.0
 PSI_LCFS_WEIGHT = 1000.0
 N_PSI = 1000
-_NBI_W_TO_MA = 1/16e6
+_NBI_A_PER_W = 1.0e6 / 16.0e6  # NBI current drive estimate: 1 MA per 16 MW; TORAX I_generic is in A
 mu_0 = 4.0 * np.pi * 1e-7
 #: Flux surfaces per equilibrium handed to TORAX (see fsa_psi_norm).
 #:
@@ -197,6 +197,7 @@ log_redirect_setup()
 
 # Now import "noisy" packages, after running log_redirect_setup:
 import torax  # noqa: E402
+import xarray as xr  # noqa: E402
 # Internal TORAX APIs for running the loop ourselves so we can keep the raw
 # list[SimState] (run_simulation() drops the pedestal confinement_mode).
 from torax._src.pedestal_model.pedestal_transition_state import ConfinementMode  # noqa: E402
@@ -429,6 +430,8 @@ class TokaMaker_TORAX:
         self._state['l_i_tx']   = np.zeros(N)   # TX internal inductance (li3), for l_i error
         self._state['vloop_tm'] = np.zeros(N)
         self._state['vloop_tx'] = np.zeros(N)
+        self._state['tau_E_tx'] = np.zeros(N)   # TX energy confinement time W_thermal / P_loss
+        self._state['tau_R_tx'] = np.zeros(N)   # TX resistive current-diffusion time (see _run_torax)
         self._state['f_GW']     = np.zeros(N)
         self._state['f_GW_vol'] = np.zeros(N)
 
@@ -793,6 +796,8 @@ class TokaMaker_TORAX:
         self._diverted_times = None
         self._x_point_targets = None            # primary (active) nulls
         self._x_point_weight = 1000.0
+        self._x_point_isoflux = True            # also hold the primary nulls on the LCFS flux
+        self._x_point_isoflux_weight = None     # None -> falls back to _isoflux_weight
         self._secondary_x_point_targets = None  # optional corner nulls; excluded from trim_lcfs
         self._secondary_x_point_weight = None   # None -> falls back to _x_point_weight
         self._secondary_x_point_isoflux = False           # also hold the secondary nulls on the LCFS flux
@@ -895,6 +900,12 @@ class TokaMaker_TORAX:
                 else:
                     # Structural dict with string keys: recurse.
                     TokaMaker_TORAX._flatten_time_dependent(val)
+            elif key == 'prescribed_values' and isinstance(val, (tuple, list)):
+                # A PRESCRIBED source holds one time-varying profile per affected equation
+                # (e.g. generic_heat: (ion, electron)), so flatten each profile on its own.
+                profiles = {str(i): v for i, v in enumerate(val)}
+                TokaMaker_TORAX._flatten_time_dependent(profiles)
+                config[key] = tuple(profiles[str(i)] for i in range(len(val)))
             elif isinstance(val, (tuple, list)) and len(val) == 2:
                 t_arr, v_arr = val
                 try:
@@ -1315,26 +1326,18 @@ class TokaMaker_TORAX:
         vsc_weight   = cfg['vsc_weight']
 
         reg_terms = []
-        processed_for_symmetry = set()
-
         for name in self._tm.coil_sets:
-            if name in processed_for_symmetry:
-                continue
-
+            # Every coil, paired or not, gets its loose target (previous solve's current, zero
+            # before the first) and the disable weight; up-down symmetry is added on top.
             t_target = targets[name] if (targets and name in targets) else 0.0
-
-            if updownsym and 'U' in name:
-                # Enforce up-down symmetry: I_upper - I_lower = 0
-                lower_name = name.replace('U', 'L')
-                if lower_name in self._tm.coil_sets:
-                    reg_terms.append(self._tm.coil_reg_term(
-                        {name: 1.0, lower_name: -1.0}, target=0.0, weight=symmetry_weight))
-                    processed_for_symmetry.add(name)
-                    processed_for_symmetry.add(lower_name)
-                    continue
-
             weight = disable_weight if any(name.startswith(p) for p in disable_coils) else default_weight
             reg_terms.append(self._tm.coil_reg_term({name: 1.0}, target=t_target, weight=weight))
+
+            lower_name = f'{name[:-1]}L'
+            if updownsym and name.endswith('U') and lower_name in self._tm.coil_sets:
+                # Enforce up-down symmetry: I_upper - I_lower = 0
+                reg_terms.append(self._tm.coil_reg_term(
+                    {name: 1.0, lower_name: -1.0}, target=0.0, weight=symmetry_weight))
 
         # Virtual VSC coil
         vsc_w = vsc_weight if disable_virtual_vsc else default_weight
@@ -1824,7 +1827,8 @@ class TokaMaker_TORAX:
                                    strike_point_targets=None, trim_lcfs=True, trim_lcfs_perc_limit=0.80,
                                    secondary_x_point_targets=None, shape_target=None,
                                    secondary_x_point_weight=None, strike_point_weight=None,
-                                   secondary_x_point_isoflux=False, secondary_x_point_isoflux_weight=None):
+                                   secondary_x_point_isoflux=False, secondary_x_point_isoflux_weight=None,
+                                   x_point_isoflux=True, x_point_isoflux_weight=None):
         r'''! Configure the diverted window: X-point targets, strike points, and the optional
                 LCFS shape target — plus the weights of the constraints that only exist while
                 diverted. The always-on weights (LCFS shape isoflux and the outboard-midplane
@@ -1837,8 +1841,9 @@ class TokaMaker_TORAX:
                                        null); only these drive the `trim_lcfs` geometry below.
                 @param x_point_weight Weight for the PRIMARY saddle-point (X-point) constraints.
                                       Default 1000.0.
-                @param strike_point_targets Strike point locations, shape (n_points, 2) with [R, Z] pairs,
-                                            or None to disable.
+                @param strike_point_targets Strike point locations (where the separatrix meets the
+                                            wall), shape (n_points, 2) with [R, Z] pairs, or None
+                                            to disable. Isoflux targets while diverted.
                 @param trim_lcfs When True (default) and X-points are active, LCFS isoflux targets near
                                  the X-point(s) are removed. When False, all defined isoflux (LCFS) points
                                  are used together with the defined X-point(s).
@@ -1881,6 +1886,14 @@ class TokaMaker_TORAX:
                                                         constraints. None (default) reuses the
                                                         isoflux_weight applied to the LCFS shape
                                                         targets.
+                @param x_point_isoflux When True (default), the primary X-points are ALSO isoflux
+                                       targets while diverted, so psi at each primary null equals
+                                       psi on the LCFS (the saddle constraint alone leaves it
+                                       free). They are appended after `trim_lcfs`, so the trim
+                                       never removes them.
+                @param x_point_isoflux_weight Weight for the primary X-point isoflux constraints.
+                                              None (default) reuses the isoflux_weight applied to
+                                              the LCFS shape targets.
 
         '''
         if diverted_times is not None and len(diverted_times) != 2:
@@ -1889,6 +1902,9 @@ class TokaMaker_TORAX:
         self._diverted_times = diverted_times
         self._x_point_targets = None if x_point_targets is None else np.atleast_2d(x_point_targets)
         self._x_point_weight = x_point_weight
+        self._x_point_isoflux = bool(x_point_isoflux)
+        self._x_point_isoflux_weight = (None if x_point_isoflux_weight is None
+                                        else float(x_point_isoflux_weight))
         self._secondary_x_point_targets = (None if secondary_x_point_targets is None
                                            else np.atleast_2d(secondary_x_point_targets))
         if self._secondary_x_point_targets is not None and self._x_point_targets is None:
@@ -1966,6 +1982,7 @@ class TokaMaker_TORAX:
             ft_times = np.array(self._tm_times)[self._flattop]
             if not (ft_times[0] <= time <= ft_times[-1]):
                 return (time, time)
+            ft_start = float(ft_times[0])
         elif self._t_ave_toggle != 'on':
             raise ValueError(
                 f"Invalid t_ave_toggle {self._t_ave_toggle!r}; "
@@ -1987,6 +2004,12 @@ class TokaMaker_TORAX:
         # Enforce ignore-start: averaging window must not dip below this threshold
         t_earliest = float(tx_times[0]) + self._t_ave_ignore_start
         t_start = max(t_start, t_earliest)
+
+        # Flattop-only averaging must not reach back into the Ip ramp: a causal window
+        # straddling the flattop start averages ramp values of Ip, psi and the profiles
+        # into the first flattop solves.
+        if self._t_ave_toggle == 'flattop':
+            t_start = max(t_start, ft_start)
 
         # If the window collapsed (e.g. very early in the pulse), just use the
         # single requested timepoint so we still return something sensible.
@@ -2040,8 +2063,11 @@ class TokaMaker_TORAX:
 
         psi_on_grid_real = psi_on_grid * self._last_surface_factor
 
+        # Beyond TORAX's outermost point (psi_N ~0.99 on the cell grid, ~0.9999 on faces) hold
+        # the last value. Zero-filling current densities there put a spurious drop at the
+        # LCFS (and zeroed j_ohmic over the outer 1%) wherever the edge current is finite.
         left_fill  = float(var_data[0])
-        right_fill = 0.0 if profile_type == 'jphi-linterp' else float(var_data[-1])
+        right_fill = float(var_data[-1])
 
         # PCHIP needs a strictly increasing abscissa and has no fill_value of its own;
         # evaluate on a clipped grid and apply the same constant fills as the linear path.
@@ -2301,8 +2327,9 @@ class TokaMaker_TORAX:
             if self._use_nbi_current:
                 myconfig['sources'].setdefault('generic_current', {})
                 myconfig['sources']['generic_current']['use_absolute_current'] = True
-                myconfig['sources']['generic_current']['I_generic'] = (nbi_times, _NBI_W_TO_MA * np.array(nbi_pow))
+                myconfig['sources']['generic_current']['I_generic'] = (nbi_times, _NBI_A_PER_W * np.array(nbi_pow))
                 myconfig['sources']['generic_current']['gaussian_location'] = self._generic_heat_loc
+                myconfig['sources']['generic_current']['gaussian_width'] = self._generic_heat_width
 
         if self._generic_particle_location is not None:
             myconfig['sources']['generic_particle'] = {}
@@ -2517,14 +2544,14 @@ class TokaMaker_TORAX:
                     self._log(f'Loop {self._current_loop}: {len(self._tm_times) - n_tm} failed TM '
                               f'timestep(s) skipped in TORAX geometry map.')
 
-            # Injected psi from initial relax used the seed geometry.  If we used
-            # the TM equilibrium at t_init without a loop N re-relax, the metric changes
-            # and j becomes inconsistent.  When relax=False, force seed at t_init.
+            # The seed is the initial condition: TORAX's initial psi comes either from the
+            # initial relax on the seed or (initial_relax=False) from the seed geometry itself.
+            # Using the TM equilibrium at t_init instead would change the metric and replace
+            # that input with a re-solved state, so when relax=False force the seed at t_init.
             # When relax=True, loop N relax aligns psi with TM i=0 — keep TM.
             # steady_state_mode uses the final TM equilibrium at every TX time; do not
             # replace t_init with the seed geometry.
-            if (self._psi_init is not None and not self._relax
-                    and not self._steady_state_mode):
+            if not self._relax and not self._steady_state_mode:
                 seed_geo = self._seeds[0]['geometry']
                 if 'fsa_profiles' not in seed_geo:
                     self._log(
@@ -2535,7 +2562,8 @@ class TokaMaker_TORAX:
                     entries[self._t_init] = seed_geo
                     self._log(
                         f'Loop {self._current_loop}: seed equilibrium at t_init={self._t_init} s for TORAX '
-                        f'(psi from initial relax on seed; inter-loop relax disabled).'
+                        f'(psi from {"initial relax on " if self._psi_init is not None else ""}seed; '
+                        f'inter-loop relax disabled).'
                     )
 
             if n_tm == 0:
@@ -3009,7 +3037,23 @@ class TokaMaker_TORAX:
             sim_error=sim_error,
             torax_config=tx_config,
         )
-        return history.simulation_output_to_xr(), history, state_list
+        data_tree = history.simulation_output_to_xr()
+
+        # Resistive current-diffusion time tau_R = mu0 a^2 <sigma_par>_V (Wesson, Tokamaks), added
+        # as a derived TORAX scalar so it is extracted, time-averaged and plotted like tau_E.
+        # <sigma_par>_V is the volume average over rho_norm with weight vpr = dV/drho_norm; sigma
+        # (not eta) is averaged because the plasma column carries current like parallel conductors.
+        mu0 = 4.0E-7 * np.pi
+        sigma_par = data_tree.profiles.sigma_parallel
+        rho_norm = sigma_par.coords['rho_norm'].values
+        vpr = data_tree.profiles.vpr.to_numpy()
+        sigma_vol = (np.trapezoid(sigma_par.to_numpy() * vpr, rho_norm, axis=1)
+                     / np.trapezoid(vpr, rho_norm, axis=1))
+        a_minor = data_tree.scalars.a_minor.to_numpy()
+        data_tree['scalars']['tau_R'] = xr.DataArray(mu0 * a_minor**2 * sigma_vol, dims=['time'],
+                                                     coords={'time': sigma_par.coords['time'].values},
+                                                     attrs={'units': 's'})
+        return data_tree, history, state_list
 
     def _capture_confinement_mode(self, state_list):
         r'''! Map per-step pedestal confinement_mode to an H-mode bool series, store it per
@@ -3339,6 +3383,8 @@ class TokaMaker_TORAX:
         except Exception:
             self._state['l_i_tx'][i] = np.nan
         self._state['vloop_tx'][i]  = self._extract_tx_scalar(data_tree, 'v_loop_lcfs', t)
+        self._state['tau_E_tx'][i]  = self._extract_tx_scalar(data_tree, 'tau_E', t)
+        self._state['tau_R_tx'][i]  = self._extract_tx_scalar(data_tree, 'tau_R', t)
         self._state['f_GW'][i]      = self._extract_tx_scalar(data_tree, 'fgw_n_e_line_avg', t)
         self._state['f_GW_vol'][i]  = self._extract_tx_scalar(data_tree, 'fgw_n_e_volume_avg', t)
         self._state['q95'][i]       = self._extract_tx_scalar(data_tree, 'q95', t)
@@ -3476,6 +3522,7 @@ class TokaMaker_TORAX:
             self._results['tau_E'] = self._extract_tx_scalar_timeseries(data_tree, 'tau_E')
         except AttributeError:
             pass
+        self._results['tau_R'] = self._extract_tx_scalar_timeseries(data_tree, 'tau_R')
         try:
             self._results['f_bootstrap'] = self._extract_tx_scalar_timeseries(data_tree, 'f_bootstrap')
         except AttributeError:
@@ -3567,14 +3614,17 @@ class TokaMaker_TORAX:
         # Seed coil regularization targets
         # First coupling pass: use zero targets (None) so the solver freely finds the correct
         # coil configuration without being biased toward the initial equilibrium.
-        # Later coupling loops: seed from the last solve of the previous loop for warm-starting.
+        # Later coupling loops: seed from the previous loop's solve at the FIRST timepoint, the
+        # same timepoint the targets apply to. (The TM object's own currents are the previous
+        # loop's LAST solve: end-of-window flattop currents, which with a strong
+        # coil_default_weight drag the low-Ip startup solve into "Exceeded maxits".) Zero
+        # targets if that timepoint never solved.
         if getattr(self, '_coil_reg_config', None):
             init_targets = None
-            if self._current_loop > 0 and not self._coupling_iteration_is_first():
-                try:
-                    init_targets, _ = self._tm.get_coil_currents()
-                except Exception as e:
-                    self._log(f'TM: could not read initial equilibrium coil currents: {e}')
+            first_equil = self._state['equil'].get(solve_idx_list[0])
+            if (self._current_loop > 0 and not self._coupling_iteration_is_first()
+                    and first_equil is not None):
+                init_targets, _ = first_equil.get_coil_currents()
             self._apply_tm_coil_reg(targets=init_targets)
 
         # Debug: log coil bounds at the start of each loop (stored in A-turns)
@@ -3684,6 +3734,14 @@ class TokaMaker_TORAX:
                     self._state['strike_pts'][i] = np.empty((0, 2))
                 n_strike = len(lcfs) - n_shape
 
+                # When diverted, the primary nulls are isoflux targets too (default): they lie on
+                # the separatrix, but a saddle constraint alone leaves psi there free. Appended
+                # after the trim, which would otherwise remove them.
+                n_primary_iso = 0
+                if use_x_points and self._x_point_isoflux:
+                    lcfs = np.vstack([lcfs, self._x_point_targets])
+                    n_primary_iso = self._x_point_targets.shape[0]
+
                 # When diverted and requested, the secondary nulls are isoflux targets too, so
                 # psi at each one equals psi on the LCFS (a saddle constraint alone leaves it
                 # free). Appended last, after the trim, which never sees them.
@@ -3697,11 +3755,14 @@ class TokaMaker_TORAX:
                 # Same fallback for the secondary-null isoflux weight.
                 strike_weight = (self._isoflux_weight if self._strike_point_weight is None
                                  else self._strike_point_weight)
+                primary_iso_weight = (self._isoflux_weight if self._x_point_isoflux_weight is None
+                                      else self._x_point_isoflux_weight)
                 secondary_iso_weight = (self._isoflux_weight if self._secondary_x_point_isoflux_weight is None
                                         else self._secondary_x_point_isoflux_weight)
                 isoflux_weights = np.concatenate([
                     self._isoflux_weight * np.ones(n_shape),
                     strike_weight * np.ones(n_strike),
+                    primary_iso_weight * np.ones(n_primary_iso),
                     secondary_iso_weight * np.ones(n_secondary_iso),
                 ])
                 lcfs_psi_target = self._state['psi_lcfs_tx'][i] # _state in Wb/rad, TM uses Wb/rad (AKA Wb-rad)
@@ -4236,14 +4297,19 @@ class TokaMaker_TORAX:
             s['err_p_rms'][i]   = _rms_prof_diff(s['p_prof_tm'].get(i),   s['p_prof_tx'].get(i))
 
             # ── LCFS shape RMS: min distance of each isoflux target (as actually set —
-            #    trimmed near X-points, strike points folded in) to the achieved LCFS.
-            #    Secondary nulls set as isoflux targets are dropped: they sit far off the LCFS
-            #    by design, and _run_tm appends them last. ──
+            #    trimmed near X-points, primary nulls folded in) to the achieved LCFS.
+            #    Secondary nulls and strike points set as isoflux targets are dropped: both
+            #    sit off the closed LCFS by design (on the outer separatrix and the divertor
+            #    legs), and would otherwise put a fixed ~0.4 m floor under the RMS. ──
             iso = s['isoflux_targets'].get(i)
             sec = self._secondary_x_point_targets
             if (iso is not None and self._secondary_x_point_isoflux
                     and len(iso) > len(sec) and np.array_equal(iso[-len(sec):], sec)):
                 iso = iso[:-len(sec)]
+            strike = s['strike_pts'].get(i)
+            if iso is not None and strike is not None and len(strike):
+                on_leg = np.any(np.all(np.isclose(iso[:, None, :], strike[None, :, :]), axis=2), axis=1)
+                iso = iso[~on_leg]
             s['err_lcfs_rms'][i] = _lcfs_shape_rms(iso, s['lcfs_geo_tm'].get(i))
 
             # ── X-point RMS: only meaningful inside the diverted window, where the
@@ -4458,7 +4524,7 @@ class TokaMaker_TORAX:
             output_mode=False, skip_bad_init_equil=False, save_eqdsks=False,
             initial_relax=True, relax=False, relax_kinetics=False, relax_duration=1.0, relax_dt=0.1,
             t_ave_toggle='off', t_ave_window=0.5, t_ave_causal=True, t_ave_ignore_start=0.25,
-            loop0=False, steady_state_mode=False, run_timestamp=None):
+            loop0=False, steady_state_mode=False, run_timestamp=None, movie_speed_factor=5.0):
         r'''! Run TokaMaker_TORAX coupled pulse design loop.
 
                 @param convergence_threshold Max fractional change in consumed flux between loops for convergence.
@@ -4507,6 +4573,9 @@ class TokaMaker_TORAX:
                        Python logging (TORAX, JAX, etc.) is redirected to the log file;
                        per-loop wall time is printed.
                 @param skip_bad_init_equil If True, skip seed equilibria TORAX rejects instead of raising.
+                @param movie_speed_factor Simulated seconds per wall-clock second of the end-of-run
+                       movie (make_movie's speed_factor). The default suits pulses of hundreds of
+                       seconds; a ~1 s pulse needs ~0.05.
                 @param run_timestamp Timestamp string for the output directory and log file names.
                        Default None -> stamped when fly() is called. run_tmtx_from_config() passes
                        one so it can write the seed equilibrium figures into this run's output
@@ -4657,7 +4726,9 @@ class TokaMaker_TORAX:
         # ── Flattop detection ──
         Ip_arr = np.array(self._state['Ip'])
         Ip_max = np.max(Ip_arr)
-        flattop_threshold = 0.95 * Ip_max
+        # Near-exact: at 0.95 the flattop (and t_ave_toggle='flattop' averaging) starts
+        # mid-ramp, ~2 s before Ip actually stops rising on a 0.55 MA/s ramp.
+        flattop_threshold = 0.999 * Ip_max
         above = Ip_arr >= flattop_threshold
         if np.any(above):
             ft_start = self._tm_times[np.argmax(above)]
@@ -4978,7 +5049,7 @@ class TokaMaker_TORAX:
                 movie_name = f'{self._output_file_tag}_{movie_name}'
             _movie_path = os.path.join(self._out_dir, movie_name)
             try:
-                self.make_movie(save_path=_movie_path, display=False)
+                self.make_movie(save_path=_movie_path, display=False, speed_factor=movie_speed_factor)
             except Exception as _e:
                 self._log(f'make_movie failed: {_e}')
 
@@ -5230,6 +5301,9 @@ class TokaMaker_TORAX:
             'x_point_targets': (None if self._x_point_targets is None
                                 else np.asarray(self._x_point_targets)),
             'x_point_weight': float(self._x_point_weight),
+            'x_point_isoflux': bool(self._x_point_isoflux),
+            'x_point_isoflux_weight': (None if self._x_point_isoflux_weight is None
+                                       else float(self._x_point_isoflux_weight)),
             'secondary_x_point_targets': (None if self._secondary_x_point_targets is None
                                           else np.asarray(self._secondary_x_point_targets)),
             'secondary_x_point_weight': (None if self._secondary_x_point_weight is None
@@ -5952,44 +6026,36 @@ def _seed_tm_profiles_for_failure_profile_plot(tt, i):
     return True
 
 
-def _saddle_targets(tt):
-    r'''! Every point given a saddle constraint: primary nulls plus any secondary nulls.'''
-    primary = getattr(tt, '_x_point_targets', None)
-    secondary = getattr(tt, '_secondary_x_point_targets', None)
-    if primary is None:
-        return None
-    if secondary is None or len(secondary) == 0:
-        return primary
-    return np.vstack([primary, secondary])
+def _plot_xpoint_markers(tt, ax, i, equil, ms=10):
+    r'''! Draw X-point targets (hollow squares), strike point targets (hollow circles) and
+    achieved X-points (x's) for timestep i, all above the flux contours.
 
-
-def _x_points_active(tt, i, t=None):
-    r'''! Return True when X-point targets should be applied at timestep index i.'''
-    diverted = getattr(tt, '_diverted_times', None)
-    if diverted is None:
-        return False
-
-    div_arr = np.asarray(diverted)
-
-    # New API: diverted window defined as (t_start, t_end).
-    if (
-        div_arr.ndim == 1
-        and div_arr.size == 2
-        and np.issubdtype(div_arr.dtype, np.number)
-        and not np.issubdtype(div_arr.dtype, np.bool_)
-    ):
-        if t is None:
-            times = getattr(tt, '_tm_times', None)
-            if times is None or i >= len(times):
-                return False
-            t = times[i]
-        return float(div_arr[0]) <= float(t) <= float(div_arr[1])
-
-    # Backward compatibility: per-timestep diverted mask.
-    if div_arr.ndim == 1 and i < div_arr.size:
-        return bool(div_arr[i])
-
-    return False
+    Targets come from _state, as they were handed to TokaMaker for this solve, so they only
+    appear on steps where they were actually applied. Achieved X-points come from equil.
+    '''
+    sad = tt._state.get('saddle_targets', {}).get(i)
+    if sad is not None and len(sad) > 0:
+        sad = np.asarray(sad)
+        ax.plot(sad[:, 0], sad[:, 1], 's', mfc='none', mec='purple', ms=ms, mew=2, ls='none',
+                zorder=10, label='X-point targets')
+    sp = tt._state.get('strike_pts', {}).get(i)
+    if sp is not None and len(sp) > 0:
+        sp = np.asarray(sp)
+        ax.plot(sp[:, 0], sp[:, 1], 'o', mfc='none', mec='green', ms=ms, mew=2, ls='none',
+                zorder=10, label='Strike point targets')
+    if equil is not None:
+        x_pts, diverted = equil.get_xpoints()
+        if x_pts is not None and len(x_pts) > 0:
+            # As in plot_psi: when diverted the last X-point is the active one; the rest are faded.
+            if diverted:
+                ax.plot(x_pts[-1, 0], x_pts[-1, 1], 'x', color='r', ms=ms, mew=2, ls='none',
+                        zorder=11, label='X-point achieved')
+                x_inactive = x_pts[:-1]
+            else:
+                x_inactive = x_pts
+            if len(x_inactive) > 0:
+                ax.plot(x_inactive[:, 0], x_inactive[:, 1], 'x', color='r', alpha=0.5, ms=ms, mew=2,
+                        ls='none', zorder=11, label='X-point achieved (inactive)')
 
 
 # ── Profile plot (per-timestep diagnostic) ───────────────────────────────────
@@ -6492,7 +6558,7 @@ def _tm_diag_equil_targets(tt, ax, i, equil):
     sp = tt._state.get('strike_pts', {}).get(i)
     if sp is not None and len(sp) > 0:
         sp = np.asarray(sp)
-        h, = ax.plot(sp[:, 0], sp[:, 1], marker='^', color='green', ms=7, ls='none',
+        h, = ax.plot(sp[:, 0], sp[:, 1], marker='o', mfc='none', mec='green', ms=7, mew=1.5, ls='none',
                      label='strike point')
         handles.append(h)
     # plot_psi draws the achieved X-points itself (red 'x'), so this is a proxy handle for the
@@ -6503,7 +6569,7 @@ def _tm_diag_equil_targets(tt, ax, i, equil):
         except Exception:
             xpts = None
         if xpts is not None and len(xpts) > 0:
-            handles.append(plt.Line2D([], [], color='purple', marker='x', ls='none', ms=7, mew=1.5,
+            handles.append(plt.Line2D([], [], color='r', marker='x', ls='none', ms=7, mew=1.5,
                                       label='X-point achieved'))
     return handles
 
@@ -6545,7 +6611,15 @@ def _tm_diag_coil_panel(tt, ax, i):
     lo = np.array([bounds[c][0] / 1.0E6 if c in bounds else np.nan for c in names])
     hi = np.array([bounds[c][1] / 1.0E6 if c in bounds else np.nan for c in names])
 
-    stack = np.concatenate([I, lo[np.isfinite(lo)], hi[np.isfinite(hi)]])
+    # A failed solve can leave NaN currents; scale the axis on the finite values only.
+    n_nan = int(np.sum(~np.isfinite(I)))
+    stack = np.concatenate([I, lo, hi])
+    stack = stack[np.isfinite(stack)]
+    if stack.size == 0:
+        ax.axis('off')
+        ax.text(0.5, 0.5, 'coil currents are NaN (failed solve)', transform=ax.transAxes,
+                ha='center', va='center', fontsize=8, color='darkred')
+        return
     ymin, ymax = float(np.min(stack)), float(np.max(stack))
     pad = 0.08 * max(ymax - ymin, 1.0E-9)
     ymin, ymax = ymin - pad, ymax + pad
@@ -6573,7 +6647,9 @@ def _tm_diag_coil_panel(tt, ax, i):
     ax.tick_params(axis='y', labelsize=7)
     ax.grid(True, alpha=0.3, axis='y')
     ax.legend(fontsize=6, loc='best', framealpha=0.9, ncol=3)
-    ax.set_title(f'Coil currents vs limits ({int(np.sum(at_lim))} at limit)', fontsize=9)
+    ax.set_title(f'Coil currents vs limits ({int(np.sum(at_lim))} at limit'
+                 + (f', {n_nan} NaN)' if n_nan else ')'), fontsize=9,
+                 color='darkred' if n_nan else 'k')
 
 
 def tm_diagnostic_plot(tt, i, t, level_attempts, solve_succeeded, save_path=None, display=True,
@@ -7379,13 +7455,14 @@ def plot_tx_relax_profiles(
 # ── Scalar time-series plot ───────────────────────────────────────────────────
 
 def plot_scalars(tt, save_path=None, display=True):
-    r'''! Plot 4x3 grid of time-series scalars plus a bottom row: power channels, sources, P_LH.'''
+    r'''! Plot 4x3 grid of time-series scalars plus a bottom row (power channels, sources, P_LH)
+         and a right-hand column (tau_E, tau_R).'''
     s = tt._state
     times = tt._tm_times
 
     _row_h = 3.0
-    fig = plt.figure(figsize=(16, 5 * _row_h + 0.5 * _row_h))
-    gs = fig.add_gridspec(5, 3, height_ratios=[1, 1, 1, 1, 1], hspace=0.35, wspace=0.3)
+    fig = plt.figure(figsize=(16 * 4 / 3, 5 * _row_h + 0.5 * _row_h))
+    gs = fig.add_gridspec(5, 4, height_ratios=[1, 1, 1, 1, 1], hspace=0.35, wspace=0.4)
     axes = np.empty((4, 3), dtype=object)
     for i in range(4):
         for j in range(3):
@@ -7647,6 +7724,28 @@ def plot_scalars(tt, save_path=None, display=True):
     if h1 or h2:
         ax.legend(h1 + h2, l1 + l2, fontsize=8, loc='upper left')
 
+    # (0,3): energy confinement time tau_E = W_thermal / P_loss (TORAX post_processing)
+    ax = fig.add_subplot(gs[0, 3])
+    ax.set_title(r'$\tau_E$ (TX)')
+    t_tau, y_tau = _tx_scalar(tt, 'tau_E')
+    if t_tau is not None:
+        ax.plot(t_tau, y_tau, color=COLOR_TX, ls='-', lw=1, label=r'$\tau_E$ TX')
+        ax.legend(fontsize=8)
+    ax.set_xlabel('Time [s]')
+    ax.set_ylabel(r'$\tau_E$ [s]')
+    ax.grid(True, alpha=0.3)
+
+    # (1,3): resistive current-diffusion time tau_R (derived TORAX scalar, see _run_torax)
+    ax = fig.add_subplot(gs[1, 3])
+    ax.set_title(r'$\tau_R = \mu_0 a^2 \langle\sigma_\parallel\rangle_V$ (TX)')
+    t_tauR, y_tauR = _tx_scalar(tt, 'tau_R')
+    if t_tauR is not None:
+        ax.plot(t_tauR, y_tauR, color=COLOR_TX, ls='-', lw=1, label=r'$\tau_R$ TX')
+        ax.legend(fontsize=8)
+    ax.set_xlabel('Time [s]')
+    ax.set_ylabel(r'$\tau_R$ [s]')
+    ax.grid(True, alpha=0.3)
+
     # Bottom row (left): power channels; P_LH overlaid here and shown on log axis at right.
     ax = ax_power
     ax.set_title('Power channels [W]')
@@ -7817,8 +7916,9 @@ _ERROR_KEYS = [spec[0] for spec in _ERROR_SPECS]
 #     (the Σw normalization makes the overall scale weight-invariant), so e.g. doubling
 #     every weight changes nothing.
 #   • Defaults: primary coupled quantities (q profile, FF'/p' sources, boundary flux)
-#     at 1.0; derived/secondary scalars and the geometric shape/X-point errors at 0.5;
-#     the Ip sanity check at 0.25 (TM is constrained to Ip, so its error should be ~0).
+#     at 1.0; derived/secondary scalars and the LCFS-shape/primary X-point errors at 0.5;
+#     the Ip sanity check at 0.25 (TM is constrained to Ip, so its error should be ~0);
+#     q0, q95, V_loop and the secondary X-points at 0.0 (plotted, not in the cost).
 #   • The geometric channels (err_lcfs_rms, err_xpt_*) are constraint-SATISFACTION, not
 #     TM↔TX coupling: they are set by the TM constraints each solve and are roughly loop-
 #     independent, so they add a near-constant floor to the trend rather than converging.
@@ -7834,16 +7934,16 @@ _COUPLING_COST_WEIGHTS = {
     'err_pp_rms':   1.0,   # p' source agreement (primary)
     'err_psi_lcfs': 1.0,   # boundary poloidal flux (primary)
     'err_flux':     1.0,   # flux consumption (primary)
-    'err_q0':       0.5,
-    'err_q95':      0.5,
+    'err_q0':       0.0,   # plotted only; the q profile is covered by err_q_rms
+    'err_q95':      0.0,   # plotted only; the q profile is covered by err_q_rms
     'err_p_rms':    0.5,
     'err_psi_axis': 0.5,
     'err_beta_N':   0.5,
     'err_l_i':      0.5,
-    'err_vloop':    0.5,
+    'err_vloop':    0.0,   # plotted only
     'err_lcfs_rms':          0.5,  # geometric (constraint satisfaction); normalized by a
     'err_xpt_primary_rms':   0.5,  # geometric; NaN outside the diverted window
-    'err_xpt_secondary_rms': 0.5,  # geometric; NaN outside the diverted window
+    'err_xpt_secondary_rms': 0.0,  # plotted only
     'err_Ip':       0.25,  # sanity check: TM is constrained to Ip, should stay ~0
 }
 
@@ -8291,17 +8391,14 @@ def _coil_net_turns(tt, cname):
     return tt._tm.coil_sets.get(cname, {}).get('net_turns', 1.0)
 
 
-def _coil_aturn_clim(tt):
-    r'''! Return (min, max) colormap limits in A-turns for plot_machine's coil shading.'''
+def _coil_aperturn_clim(tt):
+    r'''! Return (min, max) colormap limits in A/turn for the movie's per-turn coil shading.'''
     vals = []
     for cname, bounds in getattr(tt, '_coil_bounds', {}).items():
-        # plot_machine shades by per-REGION A-turns, so scale the per-set bound down from
-        # net_turns (the sum over the set) to the turns of its most-wound single coil.
-        sub_coils = tt._tm.coil_sets.get(cname, {}).get('sub_coils', [])
-        n_max = max((c.get('nturns', 1.0) for c in sub_coils), default=1.0)
-        n_net = _coil_net_turns(tt, cname) or 1.0
-        vals.extend([b / n_net * n_max for b in bounds])
-    vals = [v for v in vals if v]   # zero-turn virtual coils shade nothing
+        n_net = _coil_net_turns(tt, cname)
+        if n_net == 0:
+            continue   # zero-turn virtual coils shade nothing
+        vals.extend([b / n_net for b in bounds])
     return (min(vals), max(vals)) if vals else (-1.0, 1.0)
 
 
@@ -8339,18 +8436,23 @@ def plot_coils(tt, save_path=None, display=True):
     _save_or_display(fig, save_path, display)
 
 
-def plot_coil_current_tunnel(tt, save_path=None, display=True):
+def plot_coil_current_tunnel(tt, save_path=None, display=True, margin_frac=0.1):
     r'''! Per-coil current vs time inside the rate-limited bounds "tunnel".
 
             One subplot per real coil: the solved coil current (dots connected by lines,
-            MA-turns) overlaid on the per-solve bounds. Forbidden regions (above the upper
+            kA/turn) overlaid on the per-solve bounds. Forbidden regions (above the upper
             limit and below the lower limit) are shaded gray; the allowed corridor between
             the limits is left white, so the current trace should ride through the white
             tunnel. The band at each solve time is the window [I_prev ± dIdt·dt] applied to
             that solve (centered on the previous good current, drawn at the current time).
 
-            A final subplot shows every coil's realized |dI/dt| (MA-turns/s) between
+            A final subplot shows every coil's realized |dI/dt| (kA/turn/s) between
             consecutive solves, with each coil's configured rate limit as a dashed reference.
+
+            The ramp-up figure spans the start of the pulse to flattop start plus
+            margin_frac of the ramp-up duration. If the pulse reaches ramp-down, a second
+            figure (saved with a '_rampdown' suffix) spans ramp-down plus the same fractional
+            margin before it. Without a flattop the whole pulse is shown in one figure.
 
             Requires set_coil_rate_limits() to have populated tt._coil_bounds_history during
             the solve loop; falls back to a message if no history is present.
@@ -8358,6 +8460,7 @@ def plot_coil_current_tunnel(tt, save_path=None, display=True):
             @param tt TokaMaker_TORAX instance.
             @param save_path Output path (or None to display).
             @param display Show interactively instead of saving.
+            @param margin_frac Extra time shown beyond each ramp, as a fraction of that ramp's duration.
     '''
     coil_data = tt._results.get('COIL', {})
     history = getattr(tt, '_coil_bounds_history', {}) or {}
@@ -8366,14 +8469,15 @@ def plot_coil_current_tunnel(tt, save_path=None, display=True):
 
     # Map timestep index -> time for the stored per-step bounds.
     tm_times = tt._tm_times
-    # Per-coil bounds tunnel: {cname: (t_arr, lo_arr, hi_arr)} in MA-turns, sorted by time.
+    # Per-coil bounds tunnel: {cname: (t_arr, lo_arr, hi_arr)} in kA/turn, sorted by time.
     tunnel = {}
     for cname in coil_data:
+        n_turns = tt._coil_net_turns(cname)
         pts = []
         for i, bounds in history.items():
             if cname in bounds and 0 <= i < len(tm_times):
                 lo, hi = bounds[cname]
-                pts.append((tm_times[i], lo * 1e-6, hi * 1e-6))
+                pts.append((tm_times[i], lo / n_turns * 1e-3, hi / n_turns * 1e-3))
         pts.sort()
         if pts:
             t_arr = np.array([p[0] for p in pts])
@@ -8381,79 +8485,117 @@ def plot_coil_current_tunnel(tt, save_path=None, display=True):
             hi_arr = np.array([p[2] for p in pts])
             tunnel[cname] = (t_arr, lo_arr, hi_arr)
 
+    # Time windows: ramp-up (+ margin into flattop) and, if reached, ramp-down (+ margin before).
+    times = np.array(tm_times)
+    ft = getattr(tt, '_flattop', np.zeros(len(times), dtype=bool)).astype(bool)
+    if np.any(ft):
+        ft_indices = np.where(ft)[0]
+        t_ft_start = times[ft_indices[0]]
+        t_ft_end = times[ft_indices[-1]]
+        t_ru_pad = margin_frac * (t_ft_start - times[0])
+        windows = [('Ramp-up', times[0], t_ft_start + t_ru_pad, save_path)]
+        if ft_indices[-1] < len(times) - 1:
+            t_rd_pad = margin_frac * (times[-1] - t_ft_end)
+            rd_save = None
+            if save_path is not None:
+                base, ext = os.path.splitext(save_path)
+                rd_save = f'{base}_rampdown{ext}'
+            windows.append(('Ramp-down', t_ft_end - t_rd_pad, times[-1], rd_save))
+    else:
+        windows = [(None, -np.inf, np.inf, save_path)]
+
     coil_names = sorted(coil_data.keys())
     n_coils = len(coil_names)
     ncols = 3
     # +1 panel for the combined dI/dt subplot.
     nrows = max(1, (n_coils + 1 + ncols - 1) // ncols)
-    fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 3 * nrows), squeeze=False)
+    dt_floor = float(getattr(tt, '_coil_rate_dt_floor', 0.0))
+    colors = plt.cm.tab20(np.linspace(0, 1, max(n_coils, 1)))
 
-    for k, cname in enumerate(coil_names):
-        ax = axes[k // ncols, k % ncols]
-        t_vals = np.array(sorted(coil_data[cname].keys()))
-        i_vals = np.array([coil_data[cname][t_v] * 1e-6 for t_v in t_vals])  # MA-turns
+    for phase_name, t_lo, t_hi, win_save in windows:
+        fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 3 * nrows), squeeze=False)
 
-        # Gray-outside tunnel: shade above hi and below lo, leave the corridor white.
-        if cname in tunnel:
-            t_b, lo_b, hi_b = tunnel[cname]
-            # y-range for the gray fill: pad around both the trace and the bounds.
-            stack = np.concatenate([i_vals, lo_b, hi_b]) if i_vals.size else np.concatenate([lo_b, hi_b])
-            ymin = float(np.min(stack))
-            ymax = float(np.max(stack))
-            pad = 0.08 * (ymax - ymin if ymax > ymin else max(abs(ymax), 1.0))
-            ymin -= pad
-            ymax += pad
-            ax.fill_between(t_b, hi_b, ymax, color='gray', alpha=0.3, step=None, lw=0,
-                            label='forbidden')
-            ax.fill_between(t_b, ymin, lo_b, color='gray', alpha=0.3, step=None, lw=0)
-            ax.plot(t_b, hi_b, color='dimgray', lw=0.7)
-            ax.plot(t_b, lo_b, color='dimgray', lw=0.7)
-            ax.set_ylim(ymin, ymax)
+        for k, cname in enumerate(coil_names):
+            ax = axes[k // ncols, k % ncols]
+            t_vals = np.array(sorted(coil_data[cname].keys()))
+            n_turns = tt._coil_net_turns(cname)
+            i_vals = np.array([coil_data[cname][t_v] / n_turns * 1e-3 for t_v in t_vals])  # A-turns -> kA/turn
+            in_win = (t_vals >= t_lo) & (t_vals <= t_hi)
+            t_vals = t_vals[in_win]
+            i_vals = i_vals[in_win]
 
-        ax.plot(t_vals, i_vals, '-o', ms=3, lw=1.3, color='C0', label='I_coil', zorder=5)
-        ax.set_title(cname, fontsize=9)
-        ax.set_ylabel('I [MA-turns]', fontsize=8)
+            # Gray-outside tunnel: shade above hi and below lo, leave the corridor white.
+            if cname in tunnel:
+                t_b, lo_b, hi_b = tunnel[cname]
+                b_win = (t_b >= t_lo) & (t_b <= t_hi)
+                t_b = t_b[b_win]
+                lo_b = lo_b[b_win]
+                hi_b = hi_b[b_win]
+            if cname in tunnel and t_b.size > 0:
+                # y-range for the gray fill: pad around both the trace and the bounds.
+                stack = np.concatenate([i_vals, lo_b, hi_b])
+                ymin = float(np.min(stack))
+                ymax = float(np.max(stack))
+                pad = 0.08 * (ymax - ymin if ymax > ymin else max(abs(ymax), 1.0))
+                ymin -= pad
+                ymax += pad
+                ax.fill_between(t_b, hi_b, ymax, color='gray', alpha=0.3, step=None, lw=0,
+                                label='forbidden')
+                ax.fill_between(t_b, ymin, lo_b, color='gray', alpha=0.3, step=None, lw=0)
+                ax.plot(t_b, hi_b, color='dimgray', lw=0.7)
+                ax.plot(t_b, lo_b, color='dimgray', lw=0.7)
+                ax.set_ylim(ymin, ymax)
+
+            ax.plot(t_vals, i_vals, '-o', ms=3, lw=1.3, color='C0', label='I_coil', zorder=5)
+            ax.set_title(cname, fontsize=9)
+            ax.set_ylabel('I [kA/turn]', fontsize=8)
+            ax.set_xlabel('Time [s]', fontsize=8)
+            ax.tick_params(labelsize=7)
+            ax.grid(True, alpha=0.3)
+            ax.legend(fontsize=6, loc='best')
+
+        # Combined dI/dt subplot. The rate budget is enforced over the floored interval
+        # dt_eff = max(dt, dt_floor) — that is what the limit actually constrains — so we
+        # divide by dt_eff, not the raw consecutive dt. Dividing by a sub-floor dt would
+        # show spurious super-limit spikes even when the coil stayed inside its bound box.
+        ax = axes[n_coils // ncols, n_coils % ncols]
+        plotted = False
+        for ci, cname in enumerate(coil_names):
+            t_vals = np.array(sorted(coil_data[cname].keys()))
+            if t_vals.size < 2:
+                continue
+            n_turns = tt._coil_net_turns(cname)
+            i_vals = np.array([coil_data[cname][t_v] / n_turns for t_v in t_vals])  # A/turn
+            dt = np.diff(t_vals)
+            dt_eff = np.maximum(dt, dt_floor)
+            rate = np.abs(np.diff(i_vals)) / np.where(dt_eff == 0, np.nan, dt_eff) * 1e-3  # kA/turn/s
+            t_mid = 0.5 * (t_vals[1:] + t_vals[:-1])
+            in_win = (t_mid >= t_lo) & (t_mid <= t_hi)
+            if not np.any(in_win):
+                continue
+            ax.plot(t_mid[in_win], rate[in_win], '-o', ms=2, lw=1.0, color=colors[ci], label=cname)
+            plotted = True
+        # No limit reference here: each coil may carry its own dI/dt budget (always so when it is
+        # given in A/turn/s), which would need a separate line per coil. The per-coil bound box
+        # in the subplots above is where a breach shows up.
+        _floor_note = f' (rate over max(dt, {dt_floor:g}s))' if dt_floor > 0 else ''
+        ax.set_title(f'Realized |dI/dt|{_floor_note}', fontsize=9)
+        ax.set_ylabel('|dI/dt| [kA/turn/s]', fontsize=8)
         ax.set_xlabel('Time [s]', fontsize=8)
         ax.tick_params(labelsize=7)
         ax.grid(True, alpha=0.3)
-        ax.legend(fontsize=6, loc='best')
+        if plotted:
+            ax.legend(fontsize=5, loc='best', ncol=2)
 
-    # Combined dI/dt subplot. The rate budget is enforced over the floored interval
-    # dt_eff = max(dt, dt_floor) — that is what the limit actually constrains — so we
-    # divide by dt_eff, not the raw consecutive dt. Dividing by a sub-floor dt would
-    # show spurious super-limit spikes even when the coil stayed inside its bound box.
-    ax = axes[n_coils // ncols, n_coils % ncols]
-    dt_floor = float(getattr(tt, '_coil_rate_dt_floor', 0.0))
-    colors = plt.cm.tab20(np.linspace(0, 1, max(n_coils, 1)))
-    plotted = False
-    for ci, cname in enumerate(coil_names):
-        t_vals = np.array(sorted(coil_data[cname].keys()))
-        if t_vals.size < 2:
-            continue
-        i_vals = np.array([coil_data[cname][t_v] for t_v in t_vals])  # A-turns
-        dt = np.diff(t_vals)
-        dt_eff = np.maximum(dt, dt_floor)
-        rate = np.abs(np.diff(i_vals)) / np.where(dt_eff == 0, np.nan, dt_eff) * 1e-6  # MA-turns/s
-        t_mid = 0.5 * (t_vals[1:] + t_vals[:-1])
-        ax.plot(t_mid, rate, '-o', ms=2, lw=1.0, color=colors[ci], label=cname)
-        plotted = True
-    # No limit reference here: each coil may carry its own dI/dt budget (always so when it is
-    # given in A/turn/s), which would need a separate line per coil. The per-coil bound box
-    # in the subplots above is where a breach shows up.
-    _floor_note = f' (rate over max(dt, {dt_floor:g}s))' if dt_floor > 0 else ''
-    ax.set_title(f'Realized |dI/dt|{_floor_note}', fontsize=9)
-    ax.set_ylabel('|dI/dt| [MA-turns/s]', fontsize=8)
-    ax.set_xlabel('Time [s]', fontsize=8)
-    ax.tick_params(labelsize=7)
-    ax.grid(True, alpha=0.3)
-    if plotted:
-        ax.legend(fontsize=5, loc='best', ncol=2)
-
-    for k in range(n_coils + 1, nrows * ncols):
-        axes[k // ncols, k % ncols].axis('off')
-    plt.suptitle(f'Coil Current Tunnel (loop {tt._current_loop})', fontsize=13, y=1.0)
-    plt.tight_layout(rect=[0, 0, 1, 0.97])
-    _save_or_display(fig, save_path, display)
+        for k in range(n_coils + 1, nrows * ncols):
+            axes[k // ncols, k % ncols].axis('off')
+        if phase_name is None:
+            title = f'Coil Current Tunnel (loop {tt._current_loop})'
+        else:
+            title = f'Coil Current Tunnel \u2014 {phase_name} (loop {tt._current_loop})'
+        plt.suptitle(title, fontsize=13, y=1.0)
+        plt.tight_layout(rect=[0, 0, 1, 0.97])
+        _save_or_display(fig, win_save, display)
 
 
 # ── LCFS evolution plot ───────────────────────────────────────────────────────
@@ -8666,29 +8808,40 @@ def _render_equil_frames(tt, loop, equil_dir):
             continue
 
         fig, ax = plt.subplots(1, 1, figsize=(11, 12))
-        min_bound, max_bound = _coil_aturn_clim(tt)
-        cb = tt._tm.plot_machine(fig, ax, equilibrium=equil, coil_colormap='seismic', coil_symmap=False,
-                                  coil_scale=1.E-6, coil_clabel=r'$I_C$ [MA-turns]')
-        tt._tm.plot_constraints(fig, ax, equilibrium=equil)
-        if cb is not None:
-            cb.mappable.set_clim(min_bound * 1e-6, max_bound * 1e-6)
-        tt._tm.plot_psi(
-            fig, ax, equilibrium=equil, xpoint_color='r', vacuum_nlevels=2,
+        tm = tt._tm
+        tm.plot_machine(fig, ax, equilibrium=equil)
+        # Shade coils by per-turn current. plot_machine can only shade per-region A-turns, so
+        # divide each region's A-turns by that region's winding count; zero-turn regions stay gray.
+        _, region_currents = equil.get_coil_currents()
+        reg_nturns = np.zeros(len(region_currents))
+        for coil_set in tm.coil_sets.values():
+            for sub_coil in coil_set['sub_coils']:
+                reg_nturns[sub_coil['reg_id'] - 1] = sub_coil.get('nturns', 1.0)
+        cell_nturns = reg_nturns[tm.reg - 1]
+        mask = cell_nturns != 0.0
+        cell_I_kA = region_currents[tm.reg[mask] - 1] / cell_nturns[mask] * 1e-3   # A-turns -> kA/turn
+        if tm.settings.mirror_mode:
+            r_plot, z_plot = tm.r[:, 1], tm.r[:, 0]
+        else:
+            r_plot, z_plot = tm.r[:, 0], tm.r[:, 1]
+        min_bound, max_bound = _coil_aperturn_clim(tt)
+        clf = ax.tripcolor(r_plot, z_plot, tm.lc[mask, :], cell_I_kA, cmap='seismic',
+                           vmin=min_bound * 1e-3, vmax=max_bound * 1e-3)
+        cb = fig.colorbar(clf, ax=ax, label=r'$I_C$ [kA/turn]')
+        # Saddle targets and achieved X-points are drawn by _plot_xpoint_markers, not by
+        # plot_constraints/plot_psi, so each appears once with its own marker and legend entry.
+        tm.plot_constraints(fig, ax, equilibrium=equil, saddle_color=None)
+        tm.plot_psi(
+            fig, ax, equilibrium=equil, xpoint_color=None, vacuum_nlevels=2,
             plasma_nlevels=MOVIE_EQUIL_PSI_PLASMA_NLEVELS,
         )
-        x_pt = _saddle_targets(tt)   # primary + secondary nulls
-        if x_pt is not None and _x_points_active(tt, i, t=tt._tm_times[i]):
-            ax.plot(x_pt[:, 0], x_pt[:, 1], 'x', color='purple', markersize=10, markeredgewidth=2, label='Saddle point targets')
-        sp = tt._state.get('strike_pts', {}).get(i)
-        if sp is not None and len(sp) > 0:
-            ax.plot(sp[:, 0], sp[:, 1], 'g^', markersize=10, markeredgewidth=2, label='Strike point targets')
+        _plot_xpoint_markers(tt, ax, i, equil, ms=10)
         ax.set_aspect('equal')
         handles, _labels = ax.get_legend_handles_labels()
         if handles:
             ax.legend(loc='upper right', fontsize=12)
         ax.tick_params(labelsize=11)
-        if cb is not None:
-            cb.ax.tick_params(labelsize=11)
+        cb.ax.tick_params(labelsize=11)
         fig.savefig(out_path, dpi=MOVIE_DPI, bbox_inches='tight', pad_inches=0.0)
         plt.close(fig)
 
@@ -8889,13 +9042,14 @@ def _draw_scalars_movie(axes, tt, times, t_now, flux_con_tm):
         cs_colors = plt.cm.tab10(np.linspace(0, 1, max(len(cs_coils), 1)))
         for ci, (cname, cvals) in enumerate(cs_coils):
             ct = sorted(cvals.keys())
-            ci_vals = [cvals[t_v] * 1e-6 for t_v in ct]   # A-turns -> MA-turns
+            n_turns = tt._coil_net_turns(cname)
+            ci_vals = [cvals[t_v] / n_turns * 1e-3 for t_v in ct]   # A-turns -> kA/turn
             ax.plot(ct, ci_vals, ls=LS_PRI, lw=LW * 0.8, color=cs_colors[ci], label=cname)
         ax.legend(fontsize=LEGEND_FS - 2, loc='lower left', ncol=2)
     else:
         ax.text(0.5, 0.5, 'No CS coils', transform=ax.transAxes,
                 ha='center', va='center', fontsize=LABEL_FS)
-    ax.set_ylabel('I_coil [MA-turns]', fontsize=LABEL_FS)
+    ax.set_ylabel('I_coil [kA/turn]', fontsize=LABEL_FS)
     _style(ax)
 
     ax = axes[5]
@@ -8903,13 +9057,14 @@ def _draw_scalars_movie(axes, tt, times, t_now, flux_con_tm):
         oth_colors = plt.cm.tab20(np.linspace(0, 1, max(len(other_coils), 1)))
         for ci, (cname, cvals) in enumerate(other_coils):
             ct = sorted(cvals.keys())
-            ci_vals = [cvals[t_v] * 1e-6 for t_v in ct]   # A-turns -> MA-turns
+            n_turns = tt._coil_net_turns(cname)
+            ci_vals = [cvals[t_v] / n_turns * 1e-3 for t_v in ct]   # A-turns -> kA/turn
             ax.plot(ct, ci_vals, ls=LS_PRI, lw=LW * 0.75, color=oth_colors[ci], label=cname)
         ax.legend(fontsize=LEGEND_FS - 3, loc='lower left', ncol=2)
     else:
         ax.text(0.5, 0.5, 'No PF/other coils', transform=ax.transAxes,
                 ha='center', va='center', fontsize=LABEL_FS)
-    ax.set_ylabel('I_coil [MA-turns]', fontsize=LABEL_FS)
+    ax.set_ylabel('I_coil [kA/turn]', fontsize=LABEL_FS)
     _style(ax)
 
     for ax in np.ravel(axes):
@@ -9187,15 +9342,9 @@ def plot_equil_interactive(tt, loop=None, notebook_mode=None, save_path=None):
                                       coil_scale=1.E-6, coil_clabel=r'$I_C$ [MA-turns]')
             if cb is not None:
                 cb.mappable.set_clim(min_bound, max_bound)
-            tt._tm.plot_constraints(fig, ax, equilibrium=equil)
-            tt._tm.plot_psi(fig, ax, equilibrium=equil, xpoint_color='r', vacuum_nlevels=4)
-            x_pt = _saddle_targets(tt)   # primary + secondary nulls
-            if x_pt is not None and _x_points_active(tt, i, t=t):
-                ax.plot(x_pt[:, 0], x_pt[:, 1], 'rx', markersize=10, markeredgewidth=2,
-                        label='Saddle point targets')
-            sp = tt._state.get('strike_pts', {}).get(i)
-            if sp is not None and len(sp) > 0:
-                ax.plot(sp[:, 0], sp[:, 1], 'g^', markersize=10, markeredgewidth=2, label='Strike points')
+            tt._tm.plot_constraints(fig, ax, equilibrium=equil, saddle_color=None)
+            tt._tm.plot_psi(fig, ax, equilibrium=equil, xpoint_color=None, vacuum_nlevels=4)
+            _plot_xpoint_markers(tt, ax, i, equil, ms=10)
             ax.set_aspect('equal')
             ax.set_title(f't = {t:.3f} s  (index {i})', fontsize=14)
         else:
@@ -9606,7 +9755,21 @@ def _create_seed_equilibria(tmtx_config, mygs, save_dir=None):
           psi_lcfs_weight    : float       weight on the psi_lcfs constraint (default 10.0).
           diverted_window    : (t0, t1)    times where the plasma is diverted (X-points enforced,
                                            diverted_lcfs isoflux); limited otherwise.
-          x_points           : (n,2) array X-point [R,Z] targets used in the diverted window.
+          x_point_targets    : (n,2) array primary X-point [R,Z] targets: saddle constraints, and
+                                           isoflux points unless x_point_isoflux is False.
+          secondary_x_point_targets : (n,2) array secondary X-point [R,Z] targets: saddle
+                                           constraints, and isoflux points if
+                                           secondary_x_point_isoflux is True (optional).
+          strike_point_targets : (n,2) array where the separatrix meets the wall: isoflux
+                                           points (optional).
+          x_point_isoflux    : bool        primary X-points are also isoflux points (default True).
+          x_point_isoflux_weight : float   weight on the primary X-point isoflux points
+                                           (default isoflux_weight).
+          secondary_x_point_isoflux : bool secondary X-points are also isoflux points (default False).
+          secondary_x_point_isoflux_weight : float  weight on the secondary X-point isoflux
+                                           points (default isoflux_weight).
+          strike_point_weight : float      weight on the strike-point isoflux points
+                                           (default isoflux_weight).
           diverted_lcfs      : (n,2) array LCFS isoflux points used in the diverted window.
           n_isoflux          : int         isoflux points for the limited (analytic) LCFS (default 28).
           n_surfaces         : int         flux surfaces per seed handed to TORAX (default N_SURFACES).
@@ -9642,7 +9805,26 @@ def _create_seed_equilibria(tmtx_config, mygs, save_dir=None):
     isoflux_weight  = sc.get('isoflux_weight', 100.0)
     saddle_weight   = sc.get('saddle_weight', 10.0)
     diverted_window = sc.get('diverted_window', None)
-    x_points        = sc.get('x_points', None)
+    if 'x_points' in sc:
+        raise ValueError(
+            "seed_equil_config['x_points'] has been replaced by 'x_point_targets' (primary nulls: "
+            "saddle + isoflux) and 'secondary_x_point_targets' (secondary nulls: saddle only).")
+    x_point_targets           = sc.get('x_point_targets', None)
+    secondary_x_point_targets = sc.get('secondary_x_point_targets', None)
+    strike_point_targets      = sc.get('strike_point_targets', None)
+    x_point_isoflux           = sc.get('x_point_isoflux', True)
+    x_point_isoflux_weight    = sc.get('x_point_isoflux_weight', None)
+    secondary_x_point_isoflux = sc.get('secondary_x_point_isoflux', False)
+    secondary_x_point_isoflux_weight = sc.get('secondary_x_point_isoflux_weight', None)
+    strike_point_weight       = sc.get('strike_point_weight', None)
+    if x_point_isoflux_weight is None:
+        x_point_isoflux_weight = isoflux_weight
+    if secondary_x_point_isoflux_weight is None:
+        secondary_x_point_isoflux_weight = isoflux_weight
+    if strike_point_weight is None:
+        strike_point_weight = isoflux_weight
+    if secondary_x_point_isoflux and secondary_x_point_targets is None:
+        raise ValueError("seed_equil_config['secondary_x_point_isoflux'] requires 'secondary_x_point_targets'.")
     diverted_lcfs   = sc.get('diverted_lcfs', None)
     n_isoflux       = sc.get('n_isoflux', 28)
     n_surfaces      = sc.get('n_surfaces', tmtx_config.get('n_surfaces', N_SURFACES))
@@ -9668,15 +9850,39 @@ def _create_seed_equilibria(tmtx_config, mygs, save_dir=None):
         name = f"t{t:07.2f}_{'div' if diverted else 'lim'}"
 
         if diverted:
-            if x_points is None or diverted_lcfs is None:
-                raise ValueError("diverted_window requires both 'x_points' and 'diverted_lcfs' in seed_equil_config.")
-            mygs.set_saddle_constraints(np.asarray(x_points), weights=np.full(x_points.shape[0], saddle_weight))
-            isoflux_pts = np.asarray(diverted_lcfs)
+            if x_point_targets is None or diverted_lcfs is None:
+                raise ValueError("diverted_window requires both 'x_point_targets' and 'diverted_lcfs' in seed_equil_config.")
+            # Saddles on every null. The primaries and strike points lie on the separatrix, so
+            # they are isoflux points too; the secondaries are isoflux points only on request
+            # (holding them near the LCFS flux steers the outer legs toward the outer strike points).
+            primaries = np.atleast_2d(np.asarray(x_point_targets, dtype=float))
+            saddle_pts = primaries
+            if secondary_x_point_targets is not None:
+                secondaries = np.atleast_2d(np.asarray(secondary_x_point_targets, dtype=float))
+                saddle_pts = np.vstack([primaries, secondaries])
+            mygs.set_saddle_constraints(saddle_pts, weights=np.full(saddle_pts.shape[0], saddle_weight))
+
+            shape_pts = np.asarray(diverted_lcfs)
+            isoflux_pts = [shape_pts]
+            isoflux_w = [np.full(shape_pts.shape[0], isoflux_weight)]
+            if x_point_isoflux:
+                isoflux_pts.append(primaries)
+                isoflux_w.append(np.full(primaries.shape[0], x_point_isoflux_weight))
+            if secondary_x_point_isoflux:
+                isoflux_pts.append(secondaries)
+                isoflux_w.append(np.full(secondaries.shape[0], secondary_x_point_isoflux_weight))
+            if strike_point_targets is not None:
+                strike_pts = np.atleast_2d(np.asarray(strike_point_targets, dtype=float))
+                isoflux_pts.append(strike_pts)
+                isoflux_w.append(np.full(strike_pts.shape[0], strike_point_weight))
+            isoflux_pts = np.vstack(isoflux_pts)
+            isoflux_w = np.concatenate(isoflux_w)
         else:
             mygs.set_saddle_constraints(None)
             isoflux_pts = create_isoflux(n_isoflux, R_mag, Z0, a, kappa, delta)
+            isoflux_w = np.full(isoflux_pts.shape[0], isoflux_weight)
 
-        mygs.set_isoflux_constraints(isoflux_pts, weights=np.full(isoflux_pts.shape[0], isoflux_weight))
+        mygs.set_isoflux_constraints(isoflux_pts, weights=isoflux_w)
         mygs.set_psi_constraints(isoflux_pts, np.full(isoflux_pts.shape[0], psi_lcfs_target), weights=np.full(isoflux_pts.shape[0], psi_lcfs_weight))
         mygs.set_targets(Ip=Ip, pax=pax)
         mygs.init_psi(R_mag, Z0, a, kappa, delta)
@@ -9703,12 +9909,16 @@ def _create_seed_equilibria(tmtx_config, mygs, save_dir=None):
                             if cbnd else None)
                 if cb is not None and cbnd is not None:
                     cb.mappable.set_clim(cbnd[0] * 1.E-6, cbnd[1] * 1.E-6)
-                mygs.plot_constraints(fig, ax)
+                mygs.plot_constraints(fig, ax, saddle_marker='s')
                 mygs.plot_psi(fig, ax, xpoint_color='r', vacuum_nlevels=4)
                 _status = '' if ok else '  [FAILED — unconverged psi]'
+                # Label is the solved topology; a mismatch with the diverted_window target is flagged.
+                _topo = 'diverted' if mygs.diverted else 'limited'
+                _match = _topo == ('diverted' if diverted else 'limited')
+                _topo_label = _topo if _match else f"target {'diverted' if diverted else 'limited'}, solved {_topo.upper()}"
                 ax.set_title(f"seed {idx:02d}   t = {t:.2f} s   Ip = {Ip/1e6:.2f} MA"
-                             f"   ({'diverted' if diverted else 'limited'}){_status}",
-                             fontsize=14, color=('k' if ok else 'darkred'))
+                             f"   ({_topo_label}){_status}",
+                             fontsize=14, color=('k' if ok and _match else 'darkred'))
                 plt.tight_layout()
                 _suffix = '' if ok else '_FAILED'
                 fig.savefig(os.path.join(save_dir, f"seed_equil_{idx:03d}_{name}{_suffix}.png"),
@@ -9732,6 +9942,10 @@ def _create_seed_equilibria(tmtx_config, mygs, save_dir=None):
 
         # Successful solve: print stats, capture the seed and save the diagnostic figure.
         mygs.print_info()
+        if bool(mygs.diverted) != diverted:
+            print(f"  [{run_name}] WARNING: seed {idx:02d} at t={t:.2f}s targets "
+                  f"{'diverted' if diverted else 'limited'} but solved "
+                  f"{'DIVERTED' if mygs.diverted else 'LIMITED'}; its LCFS still sets the shape targets.")
         seeds.append(seed_from_equilibrium(mygs, n_surfaces, last_surface_factor))
         _save_seed_fig(ok=True)
 
